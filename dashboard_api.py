@@ -17,15 +17,19 @@ with auth (nginx + basic auth, or a Cloudflare Tunnel/Access policy).
 """
 
 import os
+import time
 import sqlite3
 import datetime
 import logging
 import contextlib
 from typing import Any, Dict, List
 
+import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+
+from core.model import ECMWF_ENSEMBLE_URL, WSSS_LAT, WSSS_LON
 
 logger = logging.getLogger("hermes.dashboard_api")
 logging.basicConfig(level=logging.INFO)
@@ -33,6 +37,14 @@ logging.basicConfig(level=logging.INFO)
 DB_PATH      = os.getenv("DB_PATH", "hermes.db")
 VAULT_START  = float(os.getenv("MAX_VAULT_ALLOCATION", 200.0))
 _DASHBOARD_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
+
+# ── Upstream (Open-Meteo ECMWF) health check cache ───────────────────────────
+# The dashboard polls this on a short client-side interval to show a live
+# indicator, but the check itself hits the real Open-Meteo API — caching the
+# result server-side for UPSTREAM_CACHE_TTL keeps N dashboard viewers/polls
+# from turning into N x real requests against a third-party service.
+UPSTREAM_CACHE_TTL = 30.0
+_upstream_cache: Dict[str, Any] = {"result": None, "checked_at": 0.0}
 
 app = FastAPI(title="Hermes Dashboard API", version="4.5")
 
@@ -113,6 +125,46 @@ def status():
         "sgt_now":    sg.strftime("%Y-%m-%d %H:%M SGT"),
         "utc_now":    datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
     }
+
+@app.get("/api/upstream_status")
+def upstream_status():
+    """
+    Live reachability check for the Open-Meteo ECMWF ensemble API — the
+    upstream forecast source core/model.py depends on for mu_ecmwf/sigma_ecmwf.
+    If this is down, the bot falls back to GFS-only (or the hard prior),
+    which is exactly the kind of degradation an operator wants surfaced
+    on the dashboard rather than discovered later in the logs.
+    """
+    now = time.monotonic()
+    cached = _upstream_cache["result"]
+    if cached is not None and (now - _upstream_cache["checked_at"]) < UPSTREAM_CACHE_TTL:
+        return {**cached, "cached": True}
+
+    url = ECMWF_ENSEMBLE_URL.format(lat=WSSS_LAT, lon=WSSS_LON)
+    t0 = time.monotonic()
+    try:
+        r = requests.get(url, timeout=5)
+        result = {
+            "ok":           r.status_code == 200,
+            "status_code":  r.status_code,
+            "latency_ms":   round((time.monotonic() - t0) * 1000),
+            "checked_at":   datetime.datetime.utcnow().isoformat(),
+            "source":       "ecmwf_ensemble",
+        }
+    except requests.RequestException as e:
+        logger.error(f"[DASHBOARD] Upstream ECMWF check failed: {e}")
+        result = {
+            "ok":           False,
+            "status_code":  None,
+            "latency_ms":   round((time.monotonic() - t0) * 1000),
+            "checked_at":   datetime.datetime.utcnow().isoformat(),
+            "source":       "ecmwf_ensemble",
+            "error":        str(e),
+        }
+
+    _upstream_cache["result"]     = result
+    _upstream_cache["checked_at"] = now
+    return {**result, "cached": False}
 
 @app.get("/api/kpis")
 def kpis():

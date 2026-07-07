@@ -55,8 +55,16 @@
                  border-bottom: 1px solid var(--border); margin-bottom: 20px; }
   .status-dot  { width: 7px; height: 7px; border-radius: 50%;
                  background: var(--muted); flex-shrink: 0; }
-  .status-dot.live { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .status-dot.live { background: var(--green); box-shadow: 0 0 6px var(--green);
+                      animation: pulse 2s ease-in-out infinite; }
   .status-dot.mock { background: var(--amber); }
+  .status-dot.down { background: var(--red); box-shadow: 0 0 6px var(--red); }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.4; }
+  }
+  .status-latency { font-family: var(--font-mono); color: var(--muted); }
+  .status-sep     { color: var(--border); }
 
   /* ── KPI row ── */
   .kpi-row   { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px;
@@ -157,6 +165,11 @@
   <div class="status-bar">
     <span class="status-dot" id="status-dot"></span>
     <span id="status-text">Connecting…</span>
+    <span class="status-latency" id="status-latency"></span>
+    <span class="status-sep">·</span>
+    <span class="status-dot" id="upstream-dot"></span>
+    <span id="upstream-text">ECMWF: checking…</span>
+    <span class="status-latency" id="upstream-latency"></span>
     <span style="margin-left:auto" id="last-updated"></span>
   </div>
 
@@ -625,12 +638,72 @@ function renderLatestScan(d) {
   }).join("");
 }
 
-// ── Main refresh ──────────────────────────────────────────────────────────────
+// ── Live API status poller ───────────────────────────────────────────────────
+// Runs on its own fast interval, independent of the 30s full-data refresh, so
+// the status dot reflects the API's actual up/down state in near-real-time
+// rather than only updating whenever the heavier data refresh happens to run.
+let lastStatus = null;
+
+function setStatusUI(state, text, latencyMs) {
+  const dot = document.getElementById("status-dot");
+  const txt = document.getElementById("status-text");
+  const lat = document.getElementById("status-latency");
+  const foot = document.getElementById("footer-mode");
+  dot.className = "status-dot " + state;
+  txt.textContent = text;
+  lat.textContent = latencyMs != null ? latencyMs + "ms" : "";
+  if (foot) foot.textContent = state === "live" ? "LIVE DATA" : state === "mock" ? "MOCK DATA" : "OFFLINE";
+}
+
+async function pollApiStatus() {
+  const start = performance.now();
+  try {
+    const status = await api("/api/status");
+    const latency = Math.round(performance.now() - start);
+    lastStatus = status;
+    if (status.live) {
+      setStatusUI("live", "LIVE — " + status.db_path, latency);
+    } else {
+      setStatusUI("mock", "MOCK — DB not found · Start the bot for live data", latency);
+    }
+  } catch (err) {
+    lastStatus = null;
+    setStatusUI("down", "API unreachable — is dashboard_api.py running?", null);
+  }
+}
+
+// ── Upstream ECMWF/Open-Meteo status poller ──────────────────────────────────
+// Separate dot from the backend API's own status — this reflects whether the
+// bot's actual forecast source (Open-Meteo ECMWF ensemble) is reachable, not
+// whether dashboard_api.py itself is up. The backend caches its result for
+// 30s, so polling here every 10s doesn't multiply real upstream requests.
+function setUpstreamUI(state, text, latencyMs) {
+  const dot = document.getElementById("upstream-dot");
+  const txt = document.getElementById("upstream-text");
+  const lat = document.getElementById("upstream-latency");
+  dot.className = "status-dot " + state;
+  txt.textContent = text;
+  lat.textContent = latencyMs != null ? latencyMs + "ms" : "";
+}
+
+async function pollUpstreamStatus() {
+  try {
+    const u = await api("/api/upstream_status");
+    if (u.ok) {
+      setUpstreamUI("live", "ECMWF: reachable" + (u.cached ? " (cached)" : ""), u.latency_ms);
+    } else {
+      setUpstreamUI("down", "ECMWF: unreachable — bot will fall back to GFS-only", u.latency_ms);
+    }
+  } catch (err) {
+    setUpstreamUI("down", "ECMWF: status check failed", null);
+  }
+}
+
+// ── Main refresh (heavier data — charts, tables) ─────────────────────────────
 async function refresh() {
   try {
-    const [status, kpis, equity, signals, calib, pnl, reasons, opens, trades, sigSummary, scan] =
+    const [kpis, equity, signals, calib, pnl, reasons, opens, trades, sigSummary, scan] =
       await Promise.all([
-        api("/api/status"),
         api("/api/kpis"),
         api("/api/equity"),
         api("/api/signals"),
@@ -643,19 +716,6 @@ async function refresh() {
         api("/api/latest_scan"),
       ]);
 
-    // Status bar
-    const dot  = document.getElementById("status-dot");
-    const txt  = document.getElementById("status-text");
-    const foot = document.getElementById("footer-mode");
-    if (status.live) {
-      dot.className = "status-dot live";
-      txt.textContent = "LIVE — " + status.db_path;
-      foot.textContent = "LIVE DATA";
-    } else {
-      dot.className = "status-dot mock";
-      txt.textContent = "MOCK — DB not found · Start the bot for live data";
-      foot.textContent = "MOCK DATA";
-    }
     document.getElementById("last-updated").textContent =
       "Updated " + new Date().toLocaleTimeString();
 
@@ -671,15 +731,18 @@ async function refresh() {
     renderTrades(trades);
 
   } catch (err) {
-    const dot = document.getElementById("status-dot");
-    dot.className = "status-dot";
-    document.getElementById("status-text").textContent =
-      "API unreachable — is dashboard_api.py running? (" + err.message + ")";
+    // Data refresh failed but the status poller owns the status bar —
+    // just leave the last-known charts/tables in place.
   }
 }
 
-// Boot + auto-refresh every 30s
+// Boot: backend status polls every 3s, upstream ECMWF status every 10s
+// (backend caches upstream checks for 30s regardless), full data refresh every 30s
+pollApiStatus();
+pollUpstreamStatus();
 refresh();
+setInterval(pollApiStatus, 3000);
+setInterval(pollUpstreamStatus, 10000);
 setInterval(refresh, 30000);
 </script>
 </body>
