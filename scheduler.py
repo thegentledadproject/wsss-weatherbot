@@ -284,16 +284,28 @@ def job_order_execution():
         else:
             effective_ask = 1.0 - signal.market_price.best_bid
 
+        # signal.model_prob is always P(bracket occurs) — i.e. P(YES).
+        # Kelly's p must be the win probability of the SIDE BEING SIZED:
+        #   BUY YES → wins if the bracket occurs         → p = model_prob
+        #   SELL/NO → wins if the bracket does NOT occur  → p = 1 - model_prob
+        # Previously model_prob was passed unflipped for SELL too, which fed
+        # Kelly/EV the probability of the side we're betting AGAINST — e.g. a
+        # NO trade priced favorably (effective_ask cheap) with a small
+        # model_prob scored as strongly net-negative instead of net-positive,
+        # so genuinely strong NO edges could be silently HOLD'd at the net-EV
+        # hurdle before ever reaching execution.
+        win_prob = signal.model_prob if direction == "BUY" else 1.0 - signal.model_prob
+
         if VALIDATION_MODE:
             sizing = compute_validation_size(
-                model_prob = signal.model_prob,
+                model_prob = win_prob,
                 market_ask = effective_ask,
                 direction  = direction,
             )
             logger.warning(f"[JOB3] ⚠️  VALIDATION_MODE — {label} [{direction}]: {sizing}")
         else:
             sizing = compute_size(
-                model_prob    = signal.model_prob,
+                model_prob    = win_prob,
                 market_ask    = effective_ask,
                 vault_usd     = VAULT_USD,
                 direction     = direction,
