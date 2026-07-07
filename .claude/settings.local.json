@@ -13,7 +13,13 @@
       "Bash(curl -sS -o /dev/null -w \"%{http_code}\\\\n\" https://github.com)",
       "Bash(curl -sS -o /dev/null -w \"%{http_code}\\\\n\" https://github.com/thegentledadproject/wsss-weatherbot)",
       "Bash(git config *)",
-      "Bash(GIT_CURL_VERBOSE=1 git ls-remote https://github.com/thegentledadproject/wsss-weatherbot.git)"
+      "Bash(GIT_CURL_VERBOSE=1 git ls-remote https://github.com/thegentledadproject/wsss-weatherbot.git)",
+      "Bash(git remote *)",
+      "Bash(git fetch *)",
+      "Bash(git ls-tree *)",
+      "Bash(git commit *)",
+      "Bash(git branch *)",
+      "Bash(git checkout *)"
     ]
   }
 }
