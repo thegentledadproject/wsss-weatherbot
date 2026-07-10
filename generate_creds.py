@@ -97,11 +97,11 @@ def main():
     signature_type = _parse_signature_type(sig_type_raw)
 
     try:
-        from py_clob_client.client import ClobClient
-        from py_clob_client.constants import POLYGON
+        from py_clob_client_v2.client import ClobClient
+        from py_clob_client_v2.constants import POLYGON
     except ImportError:
-        print("ERROR: py-clob-client not installed.")
-        print("Run: pip install py-clob-client")
+        print("ERROR: py-clob-client-v2 not installed.")
+        print("Run: pip install py-clob-client-v2")
         sys.exit(1)
 
     print("Connecting to Polymarket CLOB...")
@@ -118,7 +118,7 @@ def main():
             signature_type = signature_type,
             funder         = funder,
         )
-        creds = client.create_or_derive_api_creds()
+        creds = client.create_or_derive_api_key()
 
         # Defensive check: confirm all three fields actually came back
         # non-empty before declaring success — a malformed API response

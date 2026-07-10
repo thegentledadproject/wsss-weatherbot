@@ -1,4 +1,4 @@
-py-clob-client>=0.12.0
+py-clob-client-v2>=1.0.2
 apscheduler>=3.10.4
 numpy>=1.26.0
 scipy>=1.12.0

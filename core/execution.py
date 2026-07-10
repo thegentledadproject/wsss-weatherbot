@@ -24,10 +24,10 @@ import logging
 import os
 from typing import Any, Dict, Optional
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, MarketOrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY as _CLOB_BUY, SELL as _CLOB_SELL
-from py_clob_client.constants import POLYGON
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import ApiCreds, MarketOrderArgs, OrderType
+from py_clob_client_v2.order_builder.constants import BUY as _CLOB_BUY, SELL as _CLOB_SELL
+from py_clob_client_v2.constants import POLYGON
 
 from db.ledger import Ledger
 from core.edge import EdgeSignal
@@ -40,11 +40,17 @@ VWAP_DRIFT_TOLERANCE = 0.03   # Abort if book moves > 3% between compute and exe
 
 def build_client() -> ClobClient:
     """
-    Instantiate py-clob-client with Level 2 auth.
+    Instantiate py-clob-client-v2 with Level 2 auth.
     Called once at scheduler startup and reused across jobs.
 
-    Per live SDK (py-clob-client, archived May 2026, successor: py-clob-client-v2):
-      - BUY/SELL come from py_clob_client.order_builder.constants, not clob_types.Side
+    Migrated from py-clob-client (v1) after Polymarket's CLOB V2 go-live on
+    2026-04-28 made v1-signed orders rejected in production ("invalid order
+    version, please use the latest clob-client" / order_version_mismatch —
+    the v1 SDK is archived with no fix forthcoming). v2 is close to a
+    drop-in replacement for this codebase's usage:
+      - ClobClient constructor, BUY/SELL constants, MarketOrderArgs fields,
+        create_market_order()/post_order() two-step flow — all unchanged.
+      - Only real rename: create_or_derive_api_creds() → create_or_derive_api_key().
       - funder = the Polymarket deposit wallet address (proxy wallet address,
         visible at polymarket.com/settings — NOT the same as private key address
         for email/Magic wallet accounts)
@@ -95,7 +101,7 @@ def build_client() -> ClobClient:
         signature_type = signature_type,
         funder         = funder,
     )
-    client.set_api_creds(client.create_or_derive_api_creds())
+    client.set_api_creds(client.create_or_derive_api_key())
     return client
 
 

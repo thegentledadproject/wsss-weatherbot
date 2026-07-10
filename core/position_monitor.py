@@ -48,9 +48,9 @@ import logging
 import datetime
 from typing import Any, Dict, List, Optional
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import MarketOrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY as _CLOB_BUY, SELL as _CLOB_SELL
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import MarketOrderArgs, OrderType
+from py_clob_client_v2.order_builder.constants import BUY as _CLOB_BUY, SELL as _CLOB_SELL
 
 from db.ledger import Ledger
 from core.edge import fetch_market_price, MarketPrice
