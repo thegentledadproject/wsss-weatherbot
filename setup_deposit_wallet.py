@@ -56,10 +56,27 @@ import argparse
 from dotenv import load_dotenv
 
 # Cross-checked against PolygonScan's "Polymarket: pUSD Token" and
-# "Polymarket: CTF Exchange" contract tags — verify independently before
+# "Polymarket: CTF Exchange V2" contract tags — verify independently before
 # running --approve.
+#
+# NOTE: an earlier version of this constant (0x4bfb41d5b3570defd03c39a9a4d8de6
+# bd8b8982e) pointed at the OLD V1 "CTF Exchange" — PolygonScan tags it just
+# "CTF Exchange" with no version suffix, which reads as authoritative but
+# isn't the current contract. It was confirmed live-rejected by the relayer
+# with "approve spender ... is not in the allowed list" (no gas spent — the
+# relayer validates the spender before ever touching the chain). This is the
+# separately-tagged "CTF Exchange V2" contract instead.
+#
+# The deposit-wallet flow may also require approving the Neg Risk CTF
+# Exchange V2 (0xe2222d279d744050d28e00520010520000310F59) and/or the Neg
+# Risk Adapter (0xd91e80cf2e7be2e162c6513ced06f1dd0da35296) — Polymarket's
+# multi-bracket weather markets (what Hermes trades) are typically
+# neg-risk-structured. This has NOT been confirmed yet; --approve currently
+# only submits the standard CTF Exchange V2 approval. If order placement
+# still fails after this succeeds, that's the next thing to try — ask
+# before adding it blindly, since it's another unverified guess.
 PUSD_ADDRESS  = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
-CTF_EXCHANGE  = "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e"
+CTF_EXCHANGE  = "0xe111180000d2663c0091e4f400237545b87b996b"
 
 MAX_UINT256          = 2**256 - 1
 CHAIN_ID             = 137
