@@ -100,10 +100,19 @@ def _build_relayer():
 
 
 def cmd_derive(relayer) -> str:
+    from py_builder_relayer_client.models import TransactionType
+
     addr = relayer.get_expected_deposit_wallet()
-    already_deployed = relayer.get_deployed(addr)
+    # get_deployed()'s "deployed" flag has been observed to under-report for
+    # deposit wallets when queried without a type — pass WALLET_CREATE (the
+    # same type used to actually deploy one) to match. Even so, treat this as
+    # a best-effort hint, not authoritative: cmd_deploy() below additionally
+    # catches the relayer's own "wallet already deployed" error as the real
+    # source of truth, since that comes directly from the deploy attempt
+    # itself rather than a separate (and evidently sometimes-wrong) lookup.
+    already_deployed = relayer.get_deployed(addr, TransactionType.WALLET_CREATE.value)
     print(f"Expected deposit wallet address: {addr}")
-    print(f"Already deployed on-chain: {already_deployed}")
+    print(f"Already deployed on-chain (best-effort check): {already_deployed}")
     print()
     print("This is a deterministic, counterfactual address. Verify it")
     print("independently (e.g. on polygonscan.com) before funding or")
@@ -112,6 +121,8 @@ def cmd_derive(relayer) -> str:
 
 
 def cmd_deploy(relayer):
+    from py_builder_relayer_client.exceptions import RelayerApiException
+
     addr, already_deployed = cmd_derive(relayer)
     if already_deployed:
         print()
@@ -125,7 +136,20 @@ def cmd_deploy(relayer):
         print("Aborted.")
         return
 
-    resp = relayer.deploy_deposit_wallet()
+    try:
+        resp = relayer.deploy_deposit_wallet()
+    except RelayerApiException as e:
+        error_text = str(getattr(e, "error_msg", "")).lower()
+        if "already deployed" in error_text:
+            print(f"Already deployed at {addr} (confirmed by the deploy endpoint itself —")
+            print("the earlier best-effort check above just didn't catch it). No gas spent.")
+            print()
+            print("NEXT STEP (you do this yourself — this script will not move funds):")
+            print(f"  Fund {addr} with USDC.e or pUSD via your own wallet / Polymarket's UI.")
+            print("Once funded, run: python setup_deposit_wallet.py --approve")
+            return
+        raise
+
     print(f"Submitted. transaction_id={resp.transaction_id} hash={resp.transaction_hash}")
     print("Waiting for confirmation...")
     resp.wait()
@@ -142,9 +166,16 @@ def cmd_approve(relayer):
 
     addr, already_deployed = cmd_derive(relayer)
     if not already_deployed:
+        # get_deployed()'s flag has been observed to under-report (see
+        # cmd_derive's comment) -- don't hard-block on it here, since that
+        # would wrongly refuse to run --approve against a wallet that IS
+        # actually deployed. Warn instead; if it's truly not deployed yet,
+        # the batch submission below will fail with a clear error anyway.
         print()
-        print("ERROR: deposit wallet is not deployed yet. Run --deploy first.")
-        sys.exit(1)
+        print("WARNING: the best-effort deployed-check above says 'not deployed'.")
+        print("If you already ran --deploy (including an 'already deployed' response),")
+        print("this is likely a false negative -- proceeding anyway. If --approve below")
+        print("fails with a deployment-related error, run --deploy first for real.")
 
     print()
     print("Building approve() call:")
