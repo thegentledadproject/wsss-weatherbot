@@ -306,9 +306,18 @@ class BracketModel:
     Uses blended GFS+ECMWF forecast when available.
     """
 
-    def __init__(self, trailing_bias: float = 0.0, icao: str = "WSSS"):
-        self.trailing_bias = trailing_bias
-        self.icao          = icao
+    def __init__(
+        self,
+        trailing_bias:   float = 0.0,
+        icao:            str = "WSSS",
+        historical_sigma: Optional[float] = None,
+    ):
+        self.trailing_bias    = trailing_bias
+        self.icao             = icao
+        # Real day-to-day forecast error from db.ledger.fetch_residual_std —
+        # see compute()'s docstring for why this matters. None means "not
+        # enough calibration history yet" (< 2 rows), not "confirmed zero".
+        self.historical_sigma = historical_sigma
 
     def compute(
         self,
@@ -319,6 +328,20 @@ class BracketModel:
         Returns {bracket_label: probability} for all defined brackets.
         Probabilities sum to < 1.0 (remainder = tails outside [29.0, 34.0)).
         Returns {} if forecast source is "fallback" or "none" — no trading.
+
+        Sigma blending: forecast.sigma comes from ensemble MEMBER SPREAD on a
+        single run — it measures how much the models disagree with each
+        other right now, not how accurate they've actually been. Weather
+        ensembles are well documented to be under-dispersive (spread
+        understates true forecast error), and this bot's own calibration
+        history confirms it concretely: residual std dev across the last 10
+        settled days has run close to 3x the ensemble's reported sigma on
+        multiple occasions. An artificially tight sigma collapses bracket
+        probabilities to the 0.001 floor just 1-2 buckets from the mean,
+        producing implausible ~99% edges that look like free money but are
+        really just the model being falsely certain. effective_sigma takes
+        the max of the two so the model never claims to be more confident
+        than its own track record supports.
         """
         if forecast.source in ("fallback", "none"):
             logger.error(
@@ -333,17 +356,27 @@ class BracketModel:
         alpha  = SKEW_ALPHA_TABLE.get((self.icao.upper(), month), DEFAULT_SKEW_ALPHA)
         cal_mu = forecast.mu + self.trailing_bias
 
+        effective_sigma = forecast.sigma
+        if self.historical_sigma is not None and self.historical_sigma > forecast.sigma:
+            effective_sigma = float(np.clip(self.historical_sigma, 0.30, 3.00))
+            logger.warning(
+                f"[MODEL] ⚠️  Ensemble σ={forecast.sigma:.3f} is tighter than "
+                f"historical residual σ={self.historical_sigma:.3f} — widening "
+                f"to {effective_sigma:.3f} so probabilities reflect actual "
+                f"track record, not just this run's member spread."
+            )
+
         logger.info(
             f"[MODEL] μ_blend={forecast.mu:.3f} bias={self.trailing_bias:+.3f} "
-            f"→ μ_cal={cal_mu:.3f} σ={forecast.sigma:.3f} α={alpha} "
-            f"src={forecast.source}"
+            f"→ μ_cal={cal_mu:.3f} σ_ensemble={forecast.sigma:.3f} "
+            f"σ_effective={effective_sigma:.3f} α={alpha} src={forecast.source}"
         )
 
         probs: Dict[str, float] = {}
         for label, (lo, hi) in BRACKETS.items():
             p = (
-                skewnorm.cdf(hi, alpha, loc=cal_mu, scale=forecast.sigma)
-                - skewnorm.cdf(lo, alpha, loc=cal_mu, scale=forecast.sigma)
+                skewnorm.cdf(hi, alpha, loc=cal_mu, scale=effective_sigma)
+                - skewnorm.cdf(lo, alpha, loc=cal_mu, scale=effective_sigma)
             )
             probs[label] = max(0.001, float(p))
 
