@@ -106,6 +106,7 @@ from core.position_monitor import PositionMonitor
 DB_PATH       = os.getenv("DB_PATH",              "hermes.db")
 VAULT_USD     = float(os.getenv("MAX_VAULT_ALLOCATION") or 200.0)
 EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", 0.05))
+MAX_EDGE_MAGNITUDE = float(os.getenv("MAX_EDGE_MAGNITUDE", 0.50))
 TRAIL_PCT      = float(os.getenv("TRAIL_PCT", 0.20))
 
 # VALIDATION_MODE: forces $1 trades on any actionable signal, bypassing
@@ -197,9 +198,15 @@ def job_signal_scan():
         _state["signals"] = {}
         return
 
-    # Compute bracket probabilities with trailing bias
-    trailing_bias = _ledger.fetch_trailing_bias(ICAO)
-    model         = BracketModel(trailing_bias=trailing_bias, icao=ICAO)
+    # Compute bracket probabilities with trailing bias + historical sigma
+    # (see BracketModel.compute()'s docstring — ensemble spread alone has
+    # repeatedly understated real forecast error by ~3x in this bot's own
+    # calibration history).
+    trailing_bias   = _ledger.fetch_trailing_bias(ICAO)
+    historical_sigma = _ledger.fetch_residual_std(ICAO)
+    model         = BracketModel(
+        trailing_bias=trailing_bias, icao=ICAO, historical_sigma=historical_sigma,
+    )
     model_probs   = model.compute(forecast)
 
     if not model_probs:
@@ -212,9 +219,10 @@ def job_signal_scan():
 
     # Edge scan: model prob vs live market mid-price
     signals = scan_all_brackets(
-        token_matrix   = token_matrix,
-        model_probs    = model_probs,
-        edge_threshold = EDGE_THRESHOLD,
+        token_matrix       = token_matrix,
+        model_probs        = model_probs,
+        edge_threshold     = EDGE_THRESHOLD,
+        max_edge_magnitude = MAX_EDGE_MAGNITUDE,
     )
     _state["signals"] = signals
 
@@ -423,7 +431,10 @@ def main():
 
     logger.info("═" * 60)
     logger.info("  HERMES v4.6 — WSSS Weather Bracket Trader (round-the-clock)")
-    logger.info(f"  Vault: ${VAULT_USD:.0f} | Edge threshold: {EDGE_THRESHOLD*100:.0f}%")
+    logger.info(
+        f"  Vault: ${VAULT_USD:.0f} | Edge threshold: {EDGE_THRESHOLD*100:.0f}% | "
+        f"Max edge magnitude: {MAX_EDGE_MAGNITUDE*100:.0f}%"
+    )
     if VALIDATION_MODE:
         logger.warning("  ⚠️  VALIDATION_MODE ACTIVE — all trades forced to $1, EV gating bypassed")
         logger.warning("  ⚠️  Set VALIDATION_MODE=false in .env to resume normal Kelly sizing")

@@ -22,6 +22,16 @@ For NO trades (SELL YES):
   NO position pays $1 if outcome does NOT occur.
 
 Edge threshold: 5% (0.05) — set in .env as EDGE_THRESHOLD
+
+Max edge magnitude: 50% (0.50) — set in .env as MAX_EDGE_MAGNITUDE. An edge
+this large means the model claims near-certainty against a market pricing
+the opposite near-certainty — in practice this has meant the model's stated
+uncertainty (sigma) was too tight relative to its own historical accuracy,
+not that the bot found free money (see core/model.py's historical_sigma
+blending, added alongside this gate for the same underlying issue). Treated
+as a data/calibration red flag and gated from execution rather than sized
+and traded, even though it would otherwise look like the best signal on the
+board.
 """
 
 import logging
@@ -33,7 +43,8 @@ logger = logging.getLogger("hermes.edge")
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 CLOB_BOOK_URL     = "https://clob.polymarket.com/book"
 
-EDGE_THRESHOLD = 0.05  # overridden by env in scheduler
+EDGE_THRESHOLD     = 0.05  # overridden by env in scheduler
+MAX_EDGE_MAGNITUDE = 0.50  # overridden by env in scheduler
 
 
 class MarketPrice:
@@ -68,6 +79,7 @@ ACTION_SELL      = "SIGNAL_SELL_NO"   # edge <= -threshold → SELL YES / BUY NO
 ACTION_HOLD_EDGE = "HOLD_EDGE"        # priced + liquid, but |edge| < threshold
 ACTION_SKIP_LIQ  = "SKIP_ILLIQUID"   # top-of-book liquidity too low
 ACTION_SKIP_SPRD = "SKIP_SPREAD"     # bid/ask spread > 8c
+ACTION_SKIP_EXTREME = "SKIP_EXTREME_EDGE"  # |edge| > sanity cap — likely miscalibration, not opportunity
 ACTION_NO_PRICE  = "NO_PRICE"        # price fetch failed entirely
 
 
@@ -271,6 +283,7 @@ def compute_edge(
     model_prob: float,
     edge_threshold: float = EDGE_THRESHOLD,
     min_liquidity_usd: float = 10.0,
+    max_edge_magnitude: float = MAX_EDGE_MAGNITUDE,
 ) -> EdgeSignal:
     """
     Compute edge for one bracket. Always returns EdgeSignal (never None).
@@ -278,6 +291,13 @@ def compute_edge(
 
     Liquidity gate: skip if top-of-book liquidity < min_liquidity_usd.
     This blocks entry into markets where even a $25 order would move the price.
+
+    Extreme-edge gate: skip if |edge| > max_edge_magnitude. A well-liquidity,
+    tight-spread market implying near-certainty of the OPPOSITE of what the
+    model says is more often evidence the model's stated uncertainty is too
+    tight than evidence of a huge mispriced opportunity — see module
+    docstring. Checked before the liquidity/spread gates since it's a
+    data-sanity concern independent of market microstructure.
     """
     market_price = fetch_market_price(token_id)
 
@@ -291,6 +311,20 @@ def compute_edge(
         )
 
     edge = model_prob - market_price.mid_price
+
+    # Extreme-edge sanity gate — see compute_edge()'s docstring.
+    if abs(edge) > max_edge_magnitude:
+        logger.warning(
+            f"[EDGE] {bracket_label}: |edge|={abs(edge):.3f} > cap {max_edge_magnitude:.2f} "
+            f"(model={model_prob:.3f} market={market_price.mid_price:.3f}) — "
+            f"gated as likely miscalibration, not traded"
+        )
+        return EdgeSignal(
+            bracket_label=bracket_label, token_id=token_id,
+            model_prob=model_prob, market_price=market_price,
+            edge=edge, edge_threshold=edge_threshold,
+            gate_reason=ACTION_SKIP_EXTREME,
+        )
 
     # Liquidity gate — blocks two cases:
     #   1. Gamma-fallback prices (liquidity_usd == -1.0): depth unknown, so we
@@ -350,6 +384,7 @@ def scan_all_brackets(
     token_matrix: Dict[str, str],
     model_probs: Dict[str, float],
     edge_threshold: float = EDGE_THRESHOLD,
+    max_edge_magnitude: float = MAX_EDGE_MAGNITUDE,
 ) -> Dict[str, EdgeSignal]:
     """
     Run edge calculation across all brackets in token_matrix.
@@ -365,10 +400,11 @@ def scan_all_brackets(
             continue
 
         signals[label] = compute_edge(
-            bracket_label  = label,
-            token_id       = token_id,
-            model_prob     = model_prob,
-            edge_threshold = edge_threshold,
+            bracket_label       = label,
+            token_id            = token_id,
+            model_prob          = model_prob,
+            edge_threshold      = edge_threshold,
+            max_edge_magnitude  = max_edge_magnitude,
         )
 
     actionable = [l for l, s in signals.items() if s.actionable]

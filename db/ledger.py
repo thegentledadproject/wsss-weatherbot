@@ -212,6 +212,31 @@ class Ledger:
         val = row[0] if row else None
         return float(val) if val is not None else 0.0
 
+    def fetch_residual_std(self, icao: str, n: int = 10) -> Optional[float]:
+        """
+        Sample std dev (ddof=1) of the last n calibration residuals — the
+        model's REAL day-to-day forecast error, as opposed to the ensemble
+        spread core/model.py reports as its own sigma. The two can diverge
+        sharply: ensemble spread reflects member disagreement on a single
+        run, not the model's actual historical accuracy, and weather
+        ensembles are well known to be under-dispersive (spread understates
+        true error). Returns None (not 0.0) with fewer than 2 data points —
+        std dev is undefined for 0-1 samples, and the caller must not treat
+        "insufficient data" the same as "confirmed zero variance".
+        """
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT residual FROM calibration_logs
+                WHERE icao_code = ?
+                ORDER BY id DESC LIMIT ?
+            """, (icao.upper(), n)).fetchall()
+        residuals = [r[0] for r in rows]
+        if len(residuals) < 2:
+            return None
+        mean = sum(residuals) / len(residuals)
+        variance = sum((r - mean) ** 2 for r in residuals) / (len(residuals) - 1)
+        return variance ** 0.5
+
     # ── Token matrix (refreshed daily by discovery job) ──────────────────────
 
     def upsert_token_matrix(self, bracket_label: str, token_id: str, market_date: str):

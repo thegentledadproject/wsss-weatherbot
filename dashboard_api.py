@@ -254,6 +254,7 @@ def signal_summary():
         "HOLD_EDGE":      "Held — edge below 5%",
         "SKIP_ILLIQUID":  "Skipped — illiquid",
         "SKIP_SPREAD":    "Skipped — wide spread",
+        "SKIP_EXTREME_EDGE": "Skipped — implausible edge",
         "NO_PRICE":       "No price fetched",
     }
     for r in rows:
@@ -292,6 +293,7 @@ def latest_scan():
         "HOLD_EDGE":      ("HOLD",  f"edge < {THRESH*100:.0f}%", False),
         "SKIP_ILLIQUID":  ("GATED", "illiquid book",      False),
         "SKIP_SPREAD":    ("GATED", "spread > 8c",        False),
+        "SKIP_EXTREME_EDGE": ("GATED", "implausible edge — likely miscalibration", False),
         "NO_PRICE":       ("GATED", "no price",           False),
     }
     for r in scan:
