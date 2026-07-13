@@ -317,16 +317,37 @@ def latest_scan():
 
 @app.get("/api/calibration")
 def calibration():
-    """All calibration residuals."""
+    """
+    All calibration residuals, in the same id-ordered sequence the live bot
+    itself processes them in (db/ledger.py:fetch_trailing_bias orders by id,
+    not market_date — id is "the order calibration rows were written in",
+    which is usually but not always the same as calendar-date order: Job 4
+    checks both today's and yesterday's date every cycle, so a backfilled
+    prior-day entry can land right after a same-day entry, e.g. an id=N+1
+    row can have an EARLIER market_date than id=N. Rather than silently
+    reorder by market_date (which would also disagree with what the bot
+    actually used at trade time), this returns market_date alongside each
+    row so the frontend can label bars with real dates and make any such
+    out-of-order backfill visible instead of hiding it behind a generic
+    sequence number.
+
+    trailing_bias here is a ROLLING last-10 window, matching
+    fetch_trailing_bias(icao, n=10) exactly (same id order, same window
+    size) — NOT an expanding all-time average. An expanding mean smooths
+    over the bot's entire history forever and increasingly diverges from
+    what the bot is actually using to calibrate live trades as more data
+    accumulates; this makes the dashboard line track the real number.
+    """
     rows = _rows(
-        "SELECT id, timestamp, icao_code, model_mu, actual_settled, residual "
+        "SELECT id, timestamp, market_date, icao_code, model_mu, actual_settled, residual "
         "FROM calibration_logs ORDER BY id ASC"
     )
-    # Compute expanding trailing bias
-    running_sum = 0.0
-    for i, r in enumerate(rows):
-        running_sum += r["residual"]
-        r["trailing_bias"] = round(running_sum / (i + 1), 4)
+    window = []
+    for r in rows:
+        window.append(r["residual"])
+        if len(window) > 10:
+            window.pop(0)
+        r["trailing_bias"] = round(sum(window) / len(window), 4)
     return {"calibrations": rows}
 
 @app.get("/api/pnl_by_bracket")

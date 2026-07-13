@@ -507,7 +507,13 @@ function renderPnlByBracket(d) {
 
 function renderCalib(d) {
   if (!d.calibrations.length) return;
-  const labels = d.calibrations.map((_, i) => "#" + (i + 1));
+  // Real calendar date, not a generic sequence number — calibration_logs is
+  // ordered by id (write order), which usually but not always matches
+  // market_date order: Job 4 checks both today's and yesterday's date every
+  // cycle, so a backfilled prior-day entry can land right after a same-day
+  // entry. Labelling with "#1, #2..." hid that; the actual date makes any
+  // such out-of-order point visible instead of implying a clean timeline.
+  const labels = d.calibrations.map((c, i) => c.market_date || ("#" + (i + 1)));
   const resids = d.calibrations.map(c => +c.residual.toFixed(3));
   const biases = d.calibrations.map(c => +c.trailing_bias.toFixed(4));
   mkChart("chart-calib", "bar", {
