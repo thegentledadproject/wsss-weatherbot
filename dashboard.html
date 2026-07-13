@@ -249,8 +249,14 @@
   <!-- Row 2: Edge history + P&L by bracket -->
   <div class="grid-3-2">
     <div class="panel">
-      <div class="panel-title">Edge scan — model vs market probability</div>
-      <canvas id="chart-edge"></canvas>
+      <div class="panel-title">
+        Edge scan — model vs market probability, per bracket
+        <span style="margin-left:10px;font-weight:400;text-transform:none;letter-spacing:0;font-size:10px">
+          <span style="color:var(--amber)">●</span> Model
+          <span style="color:var(--teal);margin-left:8px">●</span> Market
+        </span>
+      </div>
+      <div id="chart-edge-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px"></div>
     </div>
     <div class="panel">
       <div class="panel-title">P&L by bracket &amp; direction</div>
@@ -415,39 +421,69 @@ function renderReasons(d) {
   });
 }
 
+// signal_log writes ONE row per bracket EVERY scan cycle (29°C, 30°C, 31°C,
+// 32°C, 33°C, in that order). The old chart plotted the last 60 rows on a
+// single shared x-axis with no bracket separation — since the model
+// typically favours one bracket (near the forecast mean) while the market
+// favours a different one, interleaving all 5 per cycle produced a zigzag
+// that looked like the model was unstable cycle-to-cycle, when really it
+// was just 5 different brackets' one-shot readings stacked in sequence.
+// Splitting into one small time series per bracket shows what's actually
+// happening: each bracket's own model-vs-market history over time.
+function _cssSafeBracket(label) {
+  return label.replace(/[^a-zA-Z0-9]/g, "_");
+}
+
 function renderEdge(d) {
-  if (!d.signals.length) return;
-  const last = d.signals.slice(-60);
-  const labels = last.map((s, i) => i + 1);
-  mkChart("chart-edge", "line", {
-    labels,
-    datasets: [
-      {
-        label: "Model %", data: last.map(s => +(s.model_prob * 100).toFixed(2)),
-        borderColor: AMBER, borderWidth: 1.5, fill: false,
-        pointRadius: 2, tension: 0.2,
+  const grid = document.getElementById("chart-edge-grid");
+  if (!d.signals.length) {
+    grid.innerHTML = '<div style="color:var(--muted);font-size:12px">No scan data yet.</div>';
+    return;
+  }
+
+  const byBracket = {};
+  for (const s of d.signals) {
+    if (!byBracket[s.bracket_label]) byBracket[s.bracket_label] = [];
+    byBracket[s.bracket_label].push(s);
+  }
+  const brackets = Object.keys(byBracket).sort();
+
+  // Only rebuild the canvas grid when the set of brackets actually changes —
+  // mkChart() already handles redrawing an existing canvas's data cheaply.
+  const existing = [...grid.querySelectorAll("canvas")].map(c => c.dataset.bracket);
+  if (existing.join(",") !== brackets.join(",")) {
+    grid.innerHTML = brackets.map(b => `
+      <div>
+        <div style="font-size:10px;color:var(--muted);text-align:center;margin-bottom:4px">${b}</div>
+        <canvas data-bracket="${b}" id="chart-edge-${_cssSafeBracket(b)}" style="max-height:120px"></canvas>
+      </div>
+    `).join("");
+  }
+
+  for (const b of brackets) {
+    const rows = byBracket[b].slice(-20);
+    mkChart(`chart-edge-${_cssSafeBracket(b)}`, "line", {
+      labels: rows.map((_, i) => i + 1),
+      datasets: [
+        {
+          label: "Model %", data: rows.map(s => +(s.model_prob * 100).toFixed(2)),
+          borderColor: AMBER, borderWidth: 1.5, fill: false,
+          pointRadius: 1.5, tension: 0.2,
+        },
+        {
+          label: "Market %", data: rows.map(s => +(s.market_price * 100).toFixed(2)),
+          borderColor: TEAL, borderWidth: 1.5, fill: false,
+          pointRadius: 1.5, tension: 0.2,
+        },
+      ],
+    }, {
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { display: false },
+        y: { display: false, min: 0, max: 100 },
       },
-      {
-        label: "Market %", data: last.map(s => +(s.market_price * 100).toFixed(2)),
-        borderColor: TEAL, borderWidth: 1.5, fill: false,
-        pointRadius: 2, tension: 0.2,
-      },
-    ],
-  }, {
-    plugins: {
-      legend: {
-        display: true, position: "top",
-        labels: { color: MUTED, font: { size: 10 }, padding: 10, boxWidth: 12 },
-      },
-    },
-    scales: {
-      x: { display: false },
-      y: {
-        grid: { color: BORDER },
-        ticks: { color: MUTED, font: { size: 10 }, callback: v => v + "%" },
-      },
-    },
-  });
+    });
+  }
 }
 
 function renderPnlByBracket(d) {
