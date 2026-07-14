@@ -452,6 +452,27 @@ def main():
         logger.error("[INIT] Check POLYMARKET_PRIVATE_KEY / CLOB_* env vars.")
         sys.exit(1)
 
+    # Sync the CLOB's internal balance/allowance cache for the deposit wallet
+    # against actual on-chain state. Without this, order placement can fail
+    # with "not enough balance / allowance ... balance: 0" even when the
+    # wallet is genuinely funded — confirmed live: the cache does not track
+    # on-chain changes automatically and has gone stale across ordinary bot
+    # restarts (deploys, VALIDATION_MODE toggles), not just after funding.
+    # Previously required a manual `python sync_balance.py` run after every
+    # restart; doing it here means that's no longer something an operator
+    # has to remember. Best-effort: log and continue on failure rather than
+    # blocking startup, since sync_balance.py remains available as a manual
+    # fallback and a transient failure here shouldn't take the whole bot down.
+    try:
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+        _client.update_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+        logger.info("[INIT] Balance/allowance cache synced ✓")
+    except Exception as e:
+        logger.warning(
+            f"[INIT] Balance/allowance sync failed: {e} — orders may fail with "
+            f"a stale-balance error until 'python sync_balance.py' is run manually."
+        )
+
     # Run discovery immediately on startup so jobs 2/3 have tokens from the start
     logger.info("[INIT] Running initial market discovery...")
     job_market_discovery()
