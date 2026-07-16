@@ -741,10 +741,16 @@ function setUpstreamUI(state, text, latencyMs) {
 async function pollUpstreamStatus() {
   try {
     const u = await api("/api/upstream_status");
+    const cachedSuffix = u.cached ? " (cached)" : "";
     if (u.ok) {
-      setUpstreamUI("live", "ECMWF: reachable" + (u.cached ? " (cached)" : ""), u.latency_ms);
+      setUpstreamUI("live", "ECMWF: reachable, " + u.n_members + " members" + cachedSuffix, u.latency_ms);
+    } else if (u.status_code === 200) {
+      // Reachable but degraded — HTTP 200 with too few ensemble members to
+      // trust (core/model.py requires >=3). Distinct from a network-level
+      // failure: the bot is silently running GFS-only, not erroring out.
+      setUpstreamUI("mock", "ECMWF: degraded — only " + (u.n_members ?? 0) + " members, bot falling back to GFS-only" + cachedSuffix, u.latency_ms);
     } else {
-      setUpstreamUI("down", "ECMWF: unreachable — bot will fall back to GFS-only", u.latency_ms);
+      setUpstreamUI("down", "ECMWF: unreachable — bot will fall back to GFS-only" + cachedSuffix, u.latency_ms);
     }
   } catch (err) {
     setUpstreamUI("down", "ECMWF: status check failed", null);

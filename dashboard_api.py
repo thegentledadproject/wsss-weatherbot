@@ -146,11 +146,20 @@ def status():
 @app.get("/api/upstream_status")
 def upstream_status():
     """
-    Live reachability check for the Open-Meteo ECMWF ensemble API — the
-    upstream forecast source core/model.py depends on for mu_ecmwf/sigma_ecmwf.
-    If this is down, the bot falls back to GFS-only (or the hard prior),
-    which is exactly the kind of degradation an operator wants surfaced
-    on the dashboard rather than discovered later in the logs.
+    Live health check for the Open-Meteo ECMWF ensemble API — the upstream
+    forecast source core/model.py depends on for mu_ecmwf/sigma_ecmwf. If
+    this is down, the bot falls back to GFS-only (or the hard prior), which
+    is exactly the kind of degradation an operator wants surfaced on the
+    dashboard rather than discovered later in the logs.
+
+    ok=True requires BOTH a 200 response AND >=3 ensemble members in the
+    body (the same threshold core/model.py._fetch_ensemble_members() gates
+    on). A bare status-code check isn't enough: Open-Meteo can return 200
+    with zero temperature_2m_member* keys (observed in production — the
+    bot logged "ECMWF: only 0 members returned" and fell back to GFS-only
+    while this endpoint, checking status code alone, would have reported
+    "reachable"). n_members is returned so a degraded-but-200 response is
+    visibly distinct from a fully healthy one, not just lumped into "ok".
     """
     now = time.monotonic()
     cached = _upstream_cache["result"]
@@ -161,9 +170,18 @@ def upstream_status():
     t0 = time.monotonic()
     try:
         r = requests.get(url, timeout=5)
+        n_members = None
+        if r.status_code == 200:
+            try:
+                hourly = r.json().get("hourly", {})
+                n_members = sum(1 for k in hourly if k.startswith("temperature_2m_member"))
+            except ValueError as e:
+                logger.error(f"[DASHBOARD] ECMWF response not valid JSON: {e}")
+
         result = {
-            "ok":           r.status_code == 200,
+            "ok":           r.status_code == 200 and (n_members or 0) >= 3,
             "status_code":  r.status_code,
+            "n_members":    n_members,
             "latency_ms":   round((time.monotonic() - t0) * 1000),
             "checked_at":   datetime.datetime.utcnow().isoformat(),
             "source":       "ecmwf_ensemble",
@@ -173,6 +191,7 @@ def upstream_status():
         result = {
             "ok":           False,
             "status_code":  None,
+            "n_members":    None,
             "latency_ms":   round((time.monotonic() - t0) * 1000),
             "checked_at":   datetime.datetime.utcnow().isoformat(),
             "source":       "ecmwf_ensemble",
