@@ -170,6 +170,10 @@
     <span class="status-dot" id="upstream-dot"></span>
     <span id="upstream-text">ECMWF: checking…</span>
     <span class="status-latency" id="upstream-latency"></span>
+    <span class="status-sep">·</span>
+    <span class="status-dot" id="wallet-dot"></span>
+    <span id="wallet-text">Wallet: checking…</span>
+    <span class="status-latency" id="wallet-synced"></span>
     <span style="margin-left:auto" id="last-updated"></span>
   </div>
 
@@ -741,6 +745,46 @@ async function pollUpstreamStatus() {
   }
 }
 
+// ── Wallet balance poller ─────────────────────────────────────────────────────
+// Live deposit-wallet COLLATERAL balance from the CLOB's own balance-allowance
+// cache — the same one core/execution.py now re-syncs immediately before every
+// order. Showing "synced Xs ago" (not just the dollar figure) makes a stale
+// cache visible on the dashboard instead of only surfacing as a "balance: 0"
+// order rejection buried in journalctl.
+let lastWalletSyncedAt = null;
+
+function setWalletUI(state, text, syncedLabel) {
+  const dot = document.getElementById("wallet-dot");
+  const txt = document.getElementById("wallet-text");
+  const syn = document.getElementById("wallet-synced");
+  dot.className = "status-dot " + state;
+  txt.textContent = text;
+  syn.textContent = syncedLabel || "";
+}
+
+function _agoLabel(isoTs) {
+  if (!isoTs) return "";
+  const secs = Math.max(0, Math.round((Date.now() - new Date(isoTs + "Z").getTime()) / 1000));
+  if (secs < 60) return "synced " + secs + "s ago";
+  if (secs < 3600) return "synced " + Math.round(secs / 60) + "m ago";
+  return "synced " + Math.round(secs / 3600) + "h ago";
+}
+
+async function pollWalletBalance() {
+  try {
+    const w = await api("/api/wallet_balance");
+    if (w.synced_at) lastWalletSyncedAt = w.synced_at;
+    const balText = w.balance_usd != null ? "Wallet: $" + w.balance_usd.toFixed(2) : "Wallet: unknown";
+    if (w.ok) {
+      setWalletUI("live", balText, _agoLabel(lastWalletSyncedAt));
+    } else {
+      setWalletUI("down", balText + " (sync failed)", _agoLabel(lastWalletSyncedAt));
+    }
+  } catch (err) {
+    setWalletUI("down", "Wallet: status check failed", _agoLabel(lastWalletSyncedAt));
+  }
+}
+
 // ── Main refresh (heavier data — charts, tables) ─────────────────────────────
 async function refresh() {
   try {
@@ -779,12 +823,15 @@ async function refresh() {
 }
 
 // Boot: backend status polls every 3s, upstream ECMWF status every 10s
-// (backend caches upstream checks for 30s regardless), full data refresh every 30s
+// (backend caches upstream checks for 30s regardless), wallet balance every
+// 10s (backend caches for 20s), full data refresh every 30s
 pollApiStatus();
 pollUpstreamStatus();
+pollWalletBalance();
 refresh();
 setInterval(pollApiStatus, 3000);
 setInterval(pollUpstreamStatus, 10000);
+setInterval(pollWalletBalance, 10000);
 setInterval(refresh, 30000);
 </script>
 </body>

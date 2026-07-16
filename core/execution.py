@@ -25,7 +25,7 @@ import os
 from typing import Any, Dict, Optional
 
 from py_clob_client_v2.client import ClobClient
-from py_clob_client_v2.clob_types import ApiCreds, MarketOrderArgs, OrderType
+from py_clob_client_v2.clob_types import ApiCreds, MarketOrderArgs, OrderType, BalanceAllowanceParams, AssetType
 from py_clob_client_v2.order_builder.constants import BUY as _CLOB_BUY, SELL as _CLOB_SELL
 from py_clob_client_v2.constants import POLYGON
 
@@ -402,6 +402,20 @@ class ExecutionEngine:
             side     = clob_side,
         )
         signed_order = self.client.create_market_order(order_args)
+
+        # ── Refresh balance/allowance cache immediately before posting ────────
+        # The CLOB's internal balance/allowance cache does not stay in sync with
+        # on-chain state on its own — it was going stale mid-process (not just
+        # across restarts), causing "balance: 0" rejections on a long-running
+        # process even after the startup sync (see scheduler.py [INIT] sync,
+        # PR #12) succeeded hours earlier. Sync right here, at the point of
+        # truth, so staleness can't creep back in between restarts.
+        try:
+            self.client.update_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+        except Exception as e:
+            logger.warning(f"[EXEC] {label}: pre-order balance/allowance sync failed: {e}")
 
         # ── Post order — FOK: fill entirely at/inside limit, or reject ────────
         response = self.client.post_order(signed_order, OrderType.FOK)

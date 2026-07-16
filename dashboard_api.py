@@ -21,6 +21,7 @@ import time
 import sqlite3
 import datetime
 import logging
+import threading
 import contextlib
 from typing import Any, Dict, List
 
@@ -45,6 +46,22 @@ _DASHBOARD_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dash
 # from turning into N x real requests against a third-party service.
 UPSTREAM_CACHE_TTL = 30.0
 _upstream_cache: Dict[str, Any] = {"result": None, "checked_at": 0.0}
+
+# ── Wallet balance (deposit wallet, on-chain via CLOB balance-allowance) ─────
+# Same read-only CLOB call core/execution.py now makes before every order
+# (see PR that added the pre-order balance/allowance sync) — surfaced here so
+# an operator can see the bot's own view of its funded balance without
+# grepping journalctl for "balance: 0" after the fact. The CLOB client is
+# built lazily (only once this endpoint is first hit) and reused, since
+# construction does an auth round-trip; a lock keeps concurrent dashboard
+# polls from racing to build it twice.
+WALLET_BALANCE_CACHE_TTL = 20.0
+_wallet_client = None
+_wallet_client_lock = threading.Lock()
+_wallet_balance_cache: Dict[str, Any] = {
+    "result":        None,  # last successful {"balance_usd": ..., "synced_at": iso}
+    "checked_at":    0.0,   # monotonic time of last attempt (success or fail)
+}
 
 app = FastAPI(title="Hermes Dashboard API", version="4.5")
 
@@ -165,6 +182,63 @@ def upstream_status():
     _upstream_cache["result"]     = result
     _upstream_cache["checked_at"] = now
     return {**result, "cached": False}
+
+def _get_wallet_client():
+    """Build the CLOB client once and reuse it. Read-only usage here — this
+    endpoint never signs or posts orders, only queries balance/allowance."""
+    global _wallet_client
+    if _wallet_client is not None:
+        return _wallet_client
+    with _wallet_client_lock:
+        if _wallet_client is None:
+            from core.execution import build_client
+            _wallet_client = build_client()
+        return _wallet_client
+
+@app.get("/api/wallet_balance")
+def wallet_balance():
+    """
+    Live deposit-wallet COLLATERAL balance, straight from the same CLOB
+    balance-allowance endpoint core/execution.py now syncs immediately
+    before every order (see execute()'s pre-order sync). Surfacing it here
+    lets an operator see "does the bot currently believe it has funds?"
+    without waiting for a trade attempt to fail with "balance: 0" in the logs.
+
+    Cached for WALLET_BALANCE_CACHE_TTL so dashboard polling doesn't spam
+    the CLOB API. On failure, returns the last known-good balance (if any)
+    alongside ok=False so the frontend can show a stale-but-informative
+    value instead of blanking out.
+    """
+    now = time.monotonic()
+    cached = _wallet_balance_cache["result"]
+    if cached is not None and (now - _wallet_balance_cache["checked_at"]) < WALLET_BALANCE_CACHE_TTL:
+        return {**cached, "ok": True, "cached": True}
+
+    try:
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+
+        client = _get_wallet_client()
+        client.update_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+        raw = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+
+        raw_balance = raw.get("balance") if isinstance(raw, dict) else getattr(raw, "balance", None)
+        balance_usd = round(float(raw_balance) / 1_000_000, 2) if raw_balance is not None else None
+
+        synced_at = datetime.datetime.utcnow().isoformat()
+        result = {
+            "balance_usd": balance_usd,
+            "synced_at":   synced_at,
+        }
+        _wallet_balance_cache["result"]     = result
+        _wallet_balance_cache["checked_at"] = now
+        return {**result, "ok": True, "cached": False}
+
+    except Exception as e:
+        logger.error(f"[DASHBOARD] Wallet balance sync failed: {e}")
+        _wallet_balance_cache["checked_at"] = now
+        if cached is not None:
+            return {**cached, "ok": False, "cached": True, "error": str(e)}
+        return {"balance_usd": None, "synced_at": None, "ok": False, "cached": False, "error": str(e)}
 
 @app.get("/api/kpis")
 def kpis():
