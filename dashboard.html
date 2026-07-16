@@ -484,7 +484,13 @@ function renderEdge(d) {
       plugins: { legend: { display: false } },
       scales: {
         x: { display: false },
-        y: { display: false, min: 0, max: 100 },
+        // Auto-scale to this bracket's own data range instead of a fixed
+        // 0-100 — these are 120px sparklines meant to show trend shape, and
+        // a fixed full-probability range crushes real few-point movement
+        // (e.g. a bracket oscillating 75-80%) into a couple of pixels,
+        // making genuinely-changing data look like a flat line. `grace`
+        // pads a bit above/below so the line doesn't touch the edges.
+        y: { display: false, grace: "10%" },
       },
     });
   }
