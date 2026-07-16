@@ -167,10 +167,26 @@ def _extract_vwap_ask(orderbook: Any, max_spend_usd: float) -> Optional[float]:
     if not raw_asks:
         return None
 
+    # Sort ascending (cheapest ask first) before walking — the API does not
+    # guarantee ask ordering. _extract_vwap_bid() below sorts its side
+    # (descending); this function was missing the equivalent sort, so on an
+    # unsorted book it could walk into a high-priced ask before the genuine
+    # best one. Confirmed against a real fill: this produced a computed
+    # VWAP of 0.999 for a BUY that actually filled at ~0.07 (the real best
+    # ask) — the worst-price limit derived from that bad VWAP happened to be
+    # generous enough that the fill still executed at the true, better
+    # price, but the bug corrupted every downstream EV/edge number logged
+    # for that trade and could, for a SELL, produce an unsafe (too-lenient)
+    # worst-price limit instead.
+    def _ask_price(a):
+        return float(a.price) if hasattr(a, "price") else float(a.get("price", 0.0))
+
+    sorted_asks = sorted(raw_asks, key=_ask_price)
+
     accumulated_usd    = 0.0
     accumulated_shares = 0.0
 
-    for ask in raw_asks:
+    for ask in sorted_asks:
         if hasattr(ask, "price"):
             price = float(ask.price)
             size  = float(ask.size)
@@ -248,32 +264,60 @@ def _extract_vwap_bid(orderbook: Any, max_receive_usd: float) -> Optional[float]
 def _parse_fill_status(response: Any, label: str) -> bool:
     """
     BUG-3: Inspect post_order() response for confirmed fill.
-    Returns True only on MATCHED/FILLED with size_matched > 0.
     Never calls record_position() on a rejected FOK.
+
+    Confirmed against a REAL matched order (see the PR that fixed this):
+    py_clob_client_v2's post_order() response for a filled FOK has NO
+    "size_matched" key at all — e.g.
+        {'status': 'matched', 'success': True,
+         'takingAmount': '14.285713', 'makingAmount': '0.999999',
+         'transactionsHashes': ['0x...'], 'orderID': '0x...', 'errorMsg': ''}
+    The old code read response.get("size_matched", 0.0), which always
+    defaulted to 0.0 for this real shape, so `matched > 0` was always False
+    — meaning EVERY successful fill was logged and treated as a rejection,
+    and record_position() never ran for a single real trade in this bot's
+    history (confirmed: exit_log/open_positions were both completely empty
+    despite a verified on-chain fill). Fixed to also recognize
+    takingAmount/makingAmount and the "success" flag, and to fall back to
+    the old size_matched key if a different response shape ever supplies it.
     """
     if response is None:
         logger.warning(f"[EXEC] {label}: None response from post_order()")
         return False
 
     if isinstance(response, dict):
-        status   = str(response.get("status", "")).upper()
-        matched  = float(response.get("size_matched", 0.0) or 0.0)
-        if status in ("MATCHED", "FILLED") and matched > 0:
-            logger.info(f"[EXEC] ✓ {label}: filled status={status} matched={matched:.4f}")
-            return True
-        logger.warning(f"[EXEC] ✗ {label}: FOK rejected status={status} matched={matched:.4f}")
+        data = response
+    elif hasattr(response, "status"):
+        data = {
+            "status":             getattr(response, "status", None),
+            "success":            getattr(response, "success", None),
+            "size_matched":       getattr(response, "size_matched", None),
+            "takingAmount":       getattr(response, "takingAmount", None),
+            "makingAmount":       getattr(response, "makingAmount", None),
+            "transactionsHashes": getattr(response, "transactionsHashes", None),
+        }
+    else:
+        logger.error(f"[EXEC] {label}: unknown response type {type(response)}: {response}")
         return False
 
-    if hasattr(response, "status"):
-        status  = str(getattr(response, "status", "")).upper()
-        matched = float(getattr(response, "size_matched", 0.0) or 0.0)
-        if status in ("MATCHED", "FILLED") and matched > 0:
-            logger.info(f"[EXEC] ✓ {label}: filled status={status}")
-            return True
-        logger.warning(f"[EXEC] ✗ {label}: FOK rejected status={status}")
-        return False
+    status  = str(data.get("status", "")).upper()
+    success = data.get("success")
 
-    logger.error(f"[EXEC] {label}: unknown response type {type(response)}: {response}")
+    matched = data.get("size_matched")
+    if matched is None:
+        matched = data.get("takingAmount") or data.get("makingAmount")
+    try:
+        matched = float(matched) if matched is not None else 0.0
+    except (TypeError, ValueError):
+        matched = 0.0
+
+    if status in ("MATCHED", "FILLED") and success is not False and matched > 0:
+        logger.info(f"[EXEC] ✓ {label}: filled status={status} matched={matched:.4f}")
+        return True
+
+    logger.warning(
+        f"[EXEC] ✗ {label}: FOK rejected status={status} success={success} matched={matched:.4f}"
+    )
     return False
 
 
