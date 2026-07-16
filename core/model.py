@@ -6,7 +6,7 @@ FORECAST PIPELINE:
   Source 1 — GFS 31-member ensemble (Open-Meteo ensemble API)
     Provides mu_gfs and sigma_gfs from member spread.
 
-  Source 2 — ECMWF 51-member ensemble (Open-Meteo ensemble API)
+  Source 2 — ECMWF 50-member ensemble (Open-Meteo ensemble API)
     Provides mu_ecmwf and sigma_ecmwf from member spread.
     ECMWF is the globally superior model (lower RMSE on tropical stations).
     Weighted more heavily in the blend: 60% ECMWF / 40% GFS.
@@ -43,8 +43,19 @@ WSSS_LAT = 1.3644
 WSSS_LON = 103.9915
 
 # ── Open-Meteo ensemble API ─────────────────────────────────────────────────
-# GFS: 31 members | ECMWF: 51 members
+# GFS: 31 members | ECMWF: 50 members
 # Both available free, no API key required.
+#
+# ECMWF model id was "ecmwf_ifs04" (0.4°) — confirmed stale as of 2026-07-17:
+# Open-Meteo still returns HTTP 200 for it, but the response body silently
+# drops back to the single-member deterministic shape (only a bare
+# "temperature_2m" array, no "temperature_2m_member*" keys, all null).
+# _fetch_ensemble_members() correctly detects the missing member keys and
+# falls back to GFS-only, but this was invisible on the dashboard until the
+# upstream health check was fixed to inspect the body instead of just the
+# status code — it had likely been silently GFS-only for a while before
+# that. "ecmwf_ifs025" is the current identifier (0.25° res) and returns 50
+# valid members; verified directly against the live API.
 _ENSEMBLE_BASE = (
     "https://ensemble-api.open-meteo.com/v1/ensemble"
     "?latitude={lat}&longitude={lon}"
@@ -54,7 +65,7 @@ _ENSEMBLE_BASE = (
     "&forecast_days=1"
 )
 GFS_ENSEMBLE_URL    = _ENSEMBLE_BASE.replace("{model}", "gfs_seamless")
-ECMWF_ENSEMBLE_URL  = _ENSEMBLE_BASE.replace("{model}", "ecmwf_ifs04")
+ECMWF_ENSEMBLE_URL  = _ENSEMBLE_BASE.replace("{model}", "ecmwf_ifs025")
 
 # ── Open-Meteo standard forecast (fallback if ensemble unavailable) ──────────
 OPEN_METEO_FORECAST_URL = (
