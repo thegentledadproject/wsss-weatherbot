@@ -22,6 +22,7 @@ They are called from APScheduler jobs running in a thread pool.
 
 import logging
 import os
+import time
 from typing import Any, Dict, Optional
 
 from py_clob_client_v2.client import ClobClient
@@ -36,6 +37,13 @@ from core.sizing import SizingResult
 logger = logging.getLogger("hermes.execution")
 
 VWAP_DRIFT_TOLERANCE = 0.03   # Abort if book moves > 3% between compute and exec
+
+# Pre-order balance-propagation poll: how many times to re-check
+# get_balance_allowance() after update_balance_allowance() before giving up
+# and posting anyway. 3 attempts * 0.5s = up to 1.5s added latency in the
+# worst case, negligible next to the FOK's own worst-price limit protection.
+BALANCE_POLL_ATTEMPTS   = 3
+BALANCE_POLL_DELAY_SEC  = 0.5
 
 
 def build_client() -> ClobClient:
@@ -408,12 +416,36 @@ class ExecutionEngine:
         # on-chain state on its own — it was going stale mid-process (not just
         # across restarts), causing "balance: 0" rejections on a long-running
         # process even after the startup sync (see scheduler.py [INIT] sync,
-        # PR #12) succeeded hours earlier. Sync right here, at the point of
-        # truth, so staleness can't creep back in between restarts.
+        # PR #12) succeeded hours earlier.
+        #
+        # A sync call alone is NOT enough: production logs showed
+        # update_balance_allowance() return 200 OK, immediately followed
+        # (~250ms later) by post_order() still rejecting with "balance: 0" —
+        # while a separate get_balance_allowance() call made ~10s later (via
+        # the dashboard) read the real, nonzero, on-chain-correct balance.
+        # update_balance_allowance() only TRIGGERS a re-check on Polymarket's
+        # side; its 200 response doesn't guarantee the result has propagated
+        # to what post_order() actually reads by the time it returns. Poll
+        # get_balance_allowance() briefly afterward and wait for a genuinely
+        # nonzero read (or give up after a bounded number of attempts) instead
+        # of racing straight into post_order() on the sync call's response alone.
         try:
             self.client.update_balance_allowance(
                 BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             )
+            for attempt in range(1, BALANCE_POLL_ATTEMPTS + 1):
+                check = self.client.get_balance_allowance(
+                    BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                )
+                raw_balance = check.get("balance") if isinstance(check, dict) else getattr(check, "balance", None)
+                if raw_balance is not None and float(raw_balance) > 0:
+                    break
+                logger.warning(
+                    f"[EXEC] {label}: balance still reads 0 after sync "
+                    f"(propagation check {attempt}/{BALANCE_POLL_ATTEMPTS}) — waiting"
+                )
+                if attempt < BALANCE_POLL_ATTEMPTS:
+                    time.sleep(BALANCE_POLL_DELAY_SEC)
         except Exception as e:
             logger.warning(f"[EXEC] {label}: pre-order balance/allowance sync failed: {e}")
 
