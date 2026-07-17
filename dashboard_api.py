@@ -478,14 +478,15 @@ def open_positions():
         peak      = float(peak_raw) if peak_raw is not None else entry
         r["direction"]   = direction
         r["trail_pct"]   = trail_pct
-        if direction == "YES":
-            r["trail_level"]  = round(peak * (1 - trail_pct), 5) if peak > entry else None
-            r["trail_armed"]  = peak > entry
-            r["stop_level"]   = round(entry - edge_thresh, 5)
-        else:
-            r["trail_level"]  = round(peak * (1 + trail_pct), 5) if peak < entry else None
-            r["trail_armed"]  = peak < entry
-            r["stop_level"]   = round(entry + edge_thresh, 5)
+        # Both YES and NO positions are tracked by the token actually held
+        # (its own price feed), so both behave like a plain long — price up
+        # is good, same trail/stop math regardless of direction. See
+        # core/position_monitor.py's module docstring (v4.6 fix): NO
+        # positions are opened via a direct BUY on the NO token, not a
+        # synthetic short on YES, so there's no inverted case anymore.
+        r["trail_level"]  = round(peak * (1 - trail_pct), 5) if peak > entry else None
+        r["trail_armed"]  = peak > entry
+        r["stop_level"]   = round(entry - edge_thresh, 5)
         # Hold duration
         try:
             opened = datetime.datetime.fromisoformat(r["opened_at"])
