@@ -248,14 +248,15 @@ class SettlementEngine:
 
         return None
 
-    def expire_stale(self) -> int:
+    def count_stuck_positions(self) -> int:
         """
-        PM-5: expire positions older than 28h.
+        PM-5: count positions open longer than 28h — for alerting only,
+        does not close or delete anything (see db/ledger.py's
+        find_stuck_positions() docstring for why deleting was removed).
 
         NOTE: currently dead code — scheduler.py's Job 3 calls
-        ledger.expire_stale_positions() directly, bypassing this wrapper
+        ledger.find_stuck_positions() directly, bypassing this wrapper
         entirely. Harmless (just unused), kept here in case a future
         caller wants it via SettlementEngine rather than the raw ledger.
         """
-        expired = self.ledger.expire_stale_positions(ttl_hours=28)
-        return len(expired)
+        return len(self.ledger.find_stuck_positions(ttl_hours=28))

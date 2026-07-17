@@ -349,23 +349,38 @@ class Ledger:
             logger.error(f"[-] get_peak_price failed for {token_id}: {e}")
             return 0.0
 
-    def expire_stale_positions(self, ttl_hours: int = 28) -> List[str]:
-        cutoff  = (datetime.datetime.utcnow() - datetime.timedelta(hours=ttl_hours)).isoformat()
-        expired = []
+    def find_stuck_positions(self, ttl_hours: int = 28) -> List[sqlite3.Row]:
+        """
+        Returns open_positions rows that have been open longer than
+        ttl_hours — for ALERTING only. Does NOT delete or otherwise touch
+        them.
+
+        Replaces the old expire_stale_positions(), which silently DELETEd
+        these rows without ever placing a closing order. A position open
+        this long means position_monitor.py's own per-position
+        force_time_exit logic (which already retries a REAL close every
+        Job 5 cycle for anything carried over from a prior market_date)
+        has been failing to actually close it — thin book, repeated FOK
+        rejections, or a bug. The wallet still holds the real shares.
+        Confirmed in production: two positions vanished from the dashboard
+        while still sitting open, unmanaged (no more trailing stop/stop
+        loss), and visibly held in the Polymarket wallet UI the whole
+        time — the old delete-only behaviour hid a live, unmanaged
+        financial exposure instead of surfacing it.
+
+        Job 5 keeps retrying a genuine close every cycle regardless of
+        whether this method is ever called; this only surfaces "something
+        has been stuck a long time" so an operator can investigate
+        manually if those retries keep failing.
+        """
+        cutoff = (datetime.datetime.utcnow() - datetime.timedelta(hours=ttl_hours)).isoformat()
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT token_id, bracket_label FROM open_positions WHERE opened_at < ?",
+                "SELECT token_id, bracket_label, opened_at FROM open_positions "
+                "WHERE opened_at < ?",
                 (cutoff,),
             ).fetchall()
-            for row in rows:
-                conn.execute(
-                    "DELETE FROM open_positions WHERE token_id = ?", (row["token_id"],)
-                )
-                expired.append(row["token_id"])
-                logger.warning(
-                    f"[LEDGER] TTL-expired: {row['bracket_label']} ({row['token_id']})"
-                )
-        return expired
+        return rows
 
     # ── Signal log ────────────────────────────────────────────────────────────
 

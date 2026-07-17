@@ -307,8 +307,21 @@ def job_order_execution():
         logger.info("[JOB3] No actionable signals this cycle.")
         return
 
-    # Expire stale positions before execution
-    _ledger.expire_stale_positions(ttl_hours=28)
+    # Alert on (never silently delete) positions open far longer than
+    # expected. Job 5's own per-position force_time_exit logic already
+    # retries a REAL close every cycle for anything carried over from a
+    # prior market_date — this just makes a position stuck despite those
+    # retries loud instead of invisible. See db/ledger.py's
+    # find_stuck_positions() docstring for the incident this replaced
+    # (silent deletion of two still-open, unmanaged real-money positions).
+    for stuck in _ledger.find_stuck_positions(ttl_hours=28):
+        logger.critical(
+            f"[JOB3] STUCK POSITION: {stuck['bracket_label']} ({stuck['token_id']}) "
+            f"opened_at={stuck['opened_at']} has been open >28h. Job 5 should be "
+            f"retrying its exit every cycle — if this keeps recurring, investigate "
+            f"manually (book depth? repeated FOK rejections? a bug?). Polymarket's "
+            f"own wallet UI still shows these shares as held."
+        )
 
     trailing_bias = _ledger.fetch_trailing_bias(ICAO)
     engine        = ExecutionEngine(_client, _ledger, VAULT_USD, ICAO)
