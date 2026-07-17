@@ -140,18 +140,31 @@ def _sg_now() -> datetime.datetime:
 # JOB 1 — Market Discovery (every 20 min, 24/7 — self-healing)
 # ══════════════════════════════════════════════════════════════════════════════
 def job_market_discovery():
-    sg_now = _sg_now()
-    date   = sg_now.strftime("%Y-%m-%d")
-    prior_date  = _state.get("market_date", "")
-    is_rollover = bool(prior_date) and prior_date != date
+    sg_now     = _sg_now()
+    today      = sg_now.strftime("%Y-%m-%d")
+    tomorrow   = (sg_now + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    prior_date = _state.get("market_date", "")
 
     logger.info(f"[JOB1] ── Market Discovery @ {sg_now.strftime('%H:%M SGT')} ──────")
 
+    discovery = MarketDiscovery(_ledger)
+
+    # Prefer tomorrow's market once it's live — Polymarket launches date D's
+    # market the evening of D-1 (~23:00 SGT), well before the SGT calendar
+    # date itself rolls over to D (see module docstring). quiet=True since a
+    # miss here is the normal, expected outcome for ~20 hours a day, not
+    # something to log as a warning/error every 20-min tick.
+    date   = today
+    matrix = discovery.run(tomorrow, quiet=True)
+    if matrix:
+        logger.info(f"[JOB1] Tomorrow's market ({tomorrow}) is already live — trading it now.")
+        date = tomorrow
+    else:
+        matrix = discovery.run(today)
+
+    is_rollover = bool(prior_date) and prior_date != date
     if is_rollover:
         logger.info(f"[JOB1] Date rollover detected: {prior_date} → {date}")
-
-    discovery = MarketDiscovery(_ledger)
-    matrix    = discovery.run()
 
     if not matrix:
         # "Keep the cached matrix and retry in 20 min" is only safe WITHIN
@@ -179,11 +192,12 @@ def job_market_discovery():
             logger.error("[JOB1] No tokens found and no cached matrix — Jobs 2/3 will skip.")
         matrix = {}
     else:
-        # Validate discovered tokens against live Gamma
-        valid = discovery.validate_against_live(matrix)
+        # Validate discovered tokens against live Gamma, for whichever date
+        # we actually ended up trading (today or tomorrow via lookahead).
+        valid = discovery.validate_against_live(matrix, date=date)
         if not valid:
             logger.warning("[JOB1] Validation failed — re-running discovery.")
-            matrix = discovery.run()
+            matrix = discovery.run(date)
 
     _state["token_matrix"] = matrix
     _state["market_date"]  = date
