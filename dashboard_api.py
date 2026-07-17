@@ -30,7 +30,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from core.model import ECMWF_ENSEMBLE_URL, WSSS_LAT, WSSS_LON
+from core.model import ECMWF_ENSEMBLE_URL, GFS_ENSEMBLE_URL, WSSS_LAT, WSSS_LON
 
 logger = logging.getLogger("hermes.dashboard_api")
 logging.basicConfig(level=logging.INFO)
@@ -39,13 +39,18 @@ DB_PATH      = os.getenv("DB_PATH", "hermes.db")
 VAULT_START  = float(os.getenv("MAX_VAULT_ALLOCATION", 200.0))
 _DASHBOARD_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
 
-# ── Upstream (Open-Meteo ECMWF) health check cache ───────────────────────────
+# ── Upstream (Open-Meteo GFS/ECMWF) health check cache ───────────────────────
 # The dashboard polls this on a short client-side interval to show a live
 # indicator, but the check itself hits the real Open-Meteo API — caching the
 # result server-side for UPSTREAM_CACHE_TTL keeps N dashboard viewers/polls
 # from turning into N x real requests against a third-party service.
+# One cache dict per source since GFS/ECMWF are independent upstreams with
+# independent uptime.
 UPSTREAM_CACHE_TTL = 30.0
-_upstream_cache: Dict[str, Any] = {"result": None, "checked_at": 0.0}
+_upstream_cache: Dict[str, Dict[str, Any]] = {
+    "ecmwf": {"result": None, "checked_at": 0.0},
+    "gfs":   {"result": None, "checked_at": 0.0},
+}
 
 # ── Wallet balance (deposit wallet, on-chain via CLOB balance-allowance) ─────
 # Same read-only CLOB call core/execution.py now makes before every order
@@ -143,30 +148,31 @@ def status():
         "utc_now":    datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
     }
 
-@app.get("/api/upstream_status")
-def upstream_status():
+def _check_ensemble_source(url_template: str, source: str, cache_key: str) -> Dict[str, Any]:
     """
-    Live health check for the Open-Meteo ECMWF ensemble API — the upstream
-    forecast source core/model.py depends on for mu_ecmwf/sigma_ecmwf. If
-    this is down, the bot falls back to GFS-only (or the hard prior), which
-    is exactly the kind of degradation an operator wants surfaced on the
-    dashboard rather than discovered later in the logs.
+    Live health check for one Open-Meteo ensemble source (GFS or ECMWF) —
+    the upstream forecast sources core/model.py blends into mu/sigma. If
+    either is down, the bot falls back to the other alone (or the hard
+    prior if both fail), which is exactly the kind of degradation an
+    operator wants surfaced on the dashboard rather than discovered later
+    in the logs.
 
     ok=True requires BOTH a 200 response AND >=3 ensemble members in the
     body (the same threshold core/model.py._fetch_ensemble_members() gates
     on). A bare status-code check isn't enough: Open-Meteo can return 200
-    with zero temperature_2m_member* keys (observed in production — the
-    bot logged "ECMWF: only 0 members returned" and fell back to GFS-only
-    while this endpoint, checking status code alone, would have reported
-    "reachable"). n_members is returned so a degraded-but-200 response is
-    visibly distinct from a fully healthy one, not just lumped into "ok".
+    with zero temperature_2m_member* keys (observed in production for
+    ECMWF — the bot logged "only 0 members returned" and fell back while
+    a status-code-only check would have reported "reachable"). n_members
+    is returned so a degraded-but-200 response is visibly distinct from a
+    fully healthy one, not just lumped into "ok".
     """
     now = time.monotonic()
-    cached = _upstream_cache["result"]
-    if cached is not None and (now - _upstream_cache["checked_at"]) < UPSTREAM_CACHE_TTL:
+    entry = _upstream_cache[cache_key]
+    cached = entry["result"]
+    if cached is not None and (now - entry["checked_at"]) < UPSTREAM_CACHE_TTL:
         return {**cached, "cached": True}
 
-    url = ECMWF_ENSEMBLE_URL.format(lat=WSSS_LAT, lon=WSSS_LON)
+    url = url_template.format(lat=WSSS_LAT, lon=WSSS_LON)
     t0 = time.monotonic()
     try:
         r = requests.get(url, timeout=5)
@@ -176,7 +182,7 @@ def upstream_status():
                 hourly = r.json().get("hourly", {})
                 n_members = sum(1 for k in hourly if k.startswith("temperature_2m_member"))
             except ValueError as e:
-                logger.error(f"[DASHBOARD] ECMWF response not valid JSON: {e}")
+                logger.error(f"[DASHBOARD] {source} response not valid JSON: {e}")
 
         result = {
             "ok":           r.status_code == 200 and (n_members or 0) >= 3,
@@ -184,23 +190,33 @@ def upstream_status():
             "n_members":    n_members,
             "latency_ms":   round((time.monotonic() - t0) * 1000),
             "checked_at":   datetime.datetime.utcnow().isoformat(),
-            "source":       "ecmwf_ensemble",
+            "source":       f"{source}_ensemble",
         }
     except requests.RequestException as e:
-        logger.error(f"[DASHBOARD] Upstream ECMWF check failed: {e}")
+        logger.error(f"[DASHBOARD] Upstream {source} check failed: {e}")
         result = {
             "ok":           False,
             "status_code":  None,
             "n_members":    None,
             "latency_ms":   round((time.monotonic() - t0) * 1000),
             "checked_at":   datetime.datetime.utcnow().isoformat(),
-            "source":       "ecmwf_ensemble",
+            "source":       f"{source}_ensemble",
             "error":        str(e),
         }
 
-    _upstream_cache["result"]     = result
-    _upstream_cache["checked_at"] = now
+    entry["result"]     = result
+    entry["checked_at"] = now
     return {**result, "cached": False}
+
+@app.get("/api/upstream_status")
+def upstream_status():
+    """Live health check for the Open-Meteo ECMWF ensemble API (60% blend weight)."""
+    return _check_ensemble_source(ECMWF_ENSEMBLE_URL, "ecmwf", "ecmwf")
+
+@app.get("/api/gfs_status")
+def gfs_status():
+    """Live health check for the Open-Meteo GFS ensemble API (40% blend weight)."""
+    return _check_ensemble_source(GFS_ENSEMBLE_URL, "gfs", "gfs")
 
 def _get_wallet_client():
     """Build the CLOB client once and reuse it. Read-only usage here — this
@@ -258,6 +274,45 @@ def wallet_balance():
         if cached is not None:
             return {**cached, "ok": False, "cached": True, "error": str(e)}
         return {"balance_usd": None, "synced_at": None, "ok": False, "cached": False, "error": str(e)}
+
+@app.get("/api/portfolio")
+def portfolio():
+    """
+    Live total portfolio: on-chain wallet balance (idle USDC) + current
+    market value of all open positions (same live-price fetch as
+    /api/open_positions). portfolio_usd = balance_usd + positions_value_usd
+    — the bot's real net worth right now, not just the idle cash sitting
+    in the deposit wallet between trades.
+    """
+    from core.edge import fetch_market_price
+
+    wallet      = wallet_balance()
+    balance_usd = wallet.get("balance_usd")
+
+    rows = _rows("SELECT token_id, entry_price, size_usd FROM open_positions")
+    positions_value = 0.0
+    for r in rows:
+        entry    = float(r["entry_price"])
+        size_usd = float(r["size_usd"])
+        if entry <= 0:
+            continue
+        shares_held = size_usd / entry
+        try:
+            live_price = fetch_market_price(r["token_id"])
+            price = live_price.mid_price if live_price else entry
+        except Exception as e:
+            logger.warning(f"[DASHBOARD] portfolio price fetch failed for {r['token_id']}: {e}")
+            price = entry
+        positions_value += shares_held * price
+
+    portfolio_usd = (balance_usd or 0.0) + positions_value
+    return {
+        "balance_usd":         balance_usd,
+        "positions_value_usd": round(positions_value, 2),
+        "portfolio_usd":       round(portfolio_usd, 2),
+        "n_positions":         len(rows),
+        "ok":                  wallet.get("ok", False),
+    }
 
 @app.get("/api/kpis")
 def kpis():
@@ -343,7 +398,7 @@ def signal_summary():
     # Map to display-friendly labels
     LABEL_MAP = {
         "SIGNAL_BUY":     "BUY signal",
-        "SIGNAL_SELL_NO": "SELL signal",
+        "SIGNAL_SELL_NO": "BUY NO signal",
         "HOLD_EDGE":      "Held — edge below 5%",
         "SKIP_ILLIQUID":  "Skipped — illiquid",
         "SKIP_SPREAD":    "Skipped — wide spread",
@@ -382,7 +437,12 @@ def latest_scan():
     THRESH = float(os.getenv("EDGE_THRESHOLD", 0.05))
     STATUS = {
         "SIGNAL_BUY":     ("PASS",  "BUY YES",            True),
-        "SIGNAL_SELL_NO": ("PASS",  "SELL NO",            True),
+        # Display label only — SIGNAL_SELL_NO is the internal signal-direction
+        # code from core/edge.py (predates the NO-token-direct-buy fix) and is
+        # left as-is there for DB/label continuity, but the dashboard should
+        # say what actually happens now: a real BUY order on the NO token,
+        # not a sell of anything.
+        "SIGNAL_SELL_NO": ("PASS",  "BUY NO",             True),
         "HOLD_EDGE":      ("HOLD",  f"edge < {THRESH*100:.0f}%", False),
         "SKIP_ILLIQUID":  ("GATED", "illiquid book",      False),
         "SKIP_SPREAD":    ("GATED", "spread > 8c",        False),

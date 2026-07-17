@@ -171,6 +171,10 @@
     <span id="upstream-text">ECMWF: checking…</span>
     <span class="status-latency" id="upstream-latency"></span>
     <span class="status-sep">·</span>
+    <span class="status-dot" id="gfs-dot"></span>
+    <span id="gfs-text">GFS: checking…</span>
+    <span class="status-latency" id="gfs-latency"></span>
+    <span class="status-sep">·</span>
     <span class="status-dot" id="wallet-dot"></span>
     <span id="wallet-text">Wallet: checking…</span>
     <span class="status-latency" id="wallet-synced"></span>
@@ -183,6 +187,16 @@
       <div class="kpi-label">Vault Balance</div>
       <div class="kpi-value amber" id="kpi-vault">—</div>
       <div class="kpi-sub" id="kpi-pnl">—</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Balance</div>
+      <div class="kpi-value teal" id="kpi-balance">—</div>
+      <div class="kpi-sub" id="kpi-balance-sub">wallet, live</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Portfolio</div>
+      <div class="kpi-value amber" id="kpi-portfolio">—</div>
+      <div class="kpi-sub" id="kpi-portfolio-sub">—</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label">ROI</div>
@@ -696,7 +710,7 @@ function renderLatestScan(d) {
     const rowCls   = s.passed ? "row-pass" : "";
     const badgeCls = STATUS_BADGE[s.status] || "badge-hold";
     const statusTxt = s.status === "PASS"
-      ? s.status_label            // "BUY YES" / "SELL NO"
+      ? s.status_label            // "BUY YES" / "BUY NO"
       : s.status;                 // "HOLD" / "GATED"
     return `<tr class="${rowCls}">
       <td style="font-weight:700">${s.bracket_label}</td>
@@ -776,6 +790,35 @@ async function pollUpstreamStatus() {
   }
 }
 
+// ── Upstream GFS/Open-Meteo status poller ────────────────────────────────────
+// Same shape as the ECMWF poller above, hitting the GFS-specific backend
+// endpoint — GFS and ECMWF are independent upstreams (40%/60% blend weight),
+// so either can degrade without the other.
+function setGfsUI(state, text, latencyMs) {
+  const dot = document.getElementById("gfs-dot");
+  const txt = document.getElementById("gfs-text");
+  const lat = document.getElementById("gfs-latency");
+  dot.className = "status-dot " + state;
+  txt.textContent = text;
+  lat.textContent = latencyMs != null ? latencyMs + "ms" : "";
+}
+
+async function pollGfsStatus() {
+  try {
+    const g = await api("/api/gfs_status");
+    const cachedSuffix = g.cached ? " (cached)" : "";
+    if (g.ok) {
+      setGfsUI("live", "GFS: reachable, " + g.n_members + " members" + cachedSuffix, g.latency_ms);
+    } else if (g.status_code === 200) {
+      setGfsUI("mock", "GFS: degraded — only " + (g.n_members ?? 0) + " members, bot falling back to ECMWF-only" + cachedSuffix, g.latency_ms);
+    } else {
+      setGfsUI("down", "GFS: unreachable — bot will fall back to ECMWF-only" + cachedSuffix, g.latency_ms);
+    }
+  } catch (err) {
+    setGfsUI("down", "GFS: status check failed", null);
+  }
+}
+
 // ── Wallet balance poller ─────────────────────────────────────────────────────
 // Live deposit-wallet COLLATERAL balance from the CLOB's own balance-allowance
 // cache — the same one core/execution.py now re-syncs immediately before every
@@ -816,6 +859,27 @@ async function pollWalletBalance() {
   }
 }
 
+// ── Portfolio poller (Balance + Portfolio KPI cards) ─────────────────────────
+// Balance is the idle on-chain wallet figure (same number the status-bar
+// wallet indicator shows); Portfolio adds the live market value of every
+// open position on top — the bot's real net worth right now, not just cash
+// sitting idle between trades.
+async function pollPortfolio() {
+  try {
+    const p = await api("/api/portfolio");
+    const balEl  = document.getElementById("kpi-balance");
+    const balSub = document.getElementById("kpi-balance-sub");
+    const porEl  = document.getElementById("kpi-portfolio");
+    const porSub = document.getElementById("kpi-portfolio-sub");
+    balEl.textContent = p.balance_usd != null ? "$" + p.balance_usd.toFixed(2) : "—";
+    balSub.textContent = p.ok ? "wallet, live" : "wallet, sync failed";
+    porEl.textContent = "$" + p.portfolio_usd.toFixed(2);
+    porSub.textContent = "+$" + p.positions_value_usd.toFixed(2) + " in " + p.n_positions + " open position" + (p.n_positions === 1 ? "" : "s");
+  } catch (err) {
+    // leave last-known values in place on a transient failure
+  }
+}
+
 // ── Main refresh (heavier data — charts, tables) ─────────────────────────────
 async function refresh() {
   try {
@@ -853,16 +917,21 @@ async function refresh() {
   }
 }
 
-// Boot: backend status polls every 3s, upstream ECMWF status every 10s
-// (backend caches upstream checks for 30s regardless), wallet balance every
-// 10s (backend caches for 20s), full data refresh every 30s
+// Boot: backend status polls every 3s (cheap, own backend only), upstream
+// GFS/ECMWF status + wallet balance + portfolio every 60s (these hit real
+// third-party APIs — Open-Meteo, CLOB — so poll less aggressively than the
+// backend's own cache TTLs strictly require), full data refresh every 30s
 pollApiStatus();
 pollUpstreamStatus();
+pollGfsStatus();
 pollWalletBalance();
+pollPortfolio();
 refresh();
 setInterval(pollApiStatus, 3000);
-setInterval(pollUpstreamStatus, 10000);
-setInterval(pollWalletBalance, 10000);
+setInterval(pollUpstreamStatus, 60000);
+setInterval(pollGfsStatus, 60000);
+setInterval(pollWalletBalance, 60000);
+setInterval(pollPortfolio, 60000);
 setInterval(refresh, 30000);
 </script>
 </body>
