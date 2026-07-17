@@ -445,8 +445,20 @@ function renderEdge(d) {
     return;
   }
 
+  // /api/signals returns the most recent rows across ALL market dates, not
+  // just the currently-traded one. Without this filter, a date rollover
+  // (including the same-evening "tomorrow's market is already live" switch)
+  // splices the outgoing day's now-dead price history directly onto the new
+  // day's freshly-opened market under the same bracket_label — the chart
+  // draws one continuous line through what are actually two unrelated
+  // tokens, showing a sharp "jump" that never happened as a real price move.
+  // d.signals is oldest-first (API reverses it), so the last row's date is
+  // the current market date.
+  const latestDate = d.signals[d.signals.length - 1].date;
+  const currentSignals = d.signals.filter(s => s.date === latestDate);
+
   const byBracket = {};
-  for (const s of d.signals) {
+  for (const s of currentSignals) {
     if (!byBracket[s.bracket_label]) byBracket[s.bracket_label] = [];
     byBracket[s.bracket_label].push(s);
   }
