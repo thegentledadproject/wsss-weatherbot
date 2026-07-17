@@ -43,6 +43,7 @@ Updated every Job 5 cycle when a new high/low is observed.
 """
 
 import os
+import math
 import logging
 import datetime
 from typing import Any, Dict, List, Optional
@@ -245,16 +246,39 @@ def _extract_vwap_bid_by_shares(orderbook: Any, target_shares: float) -> Optiona
 
 
 def _parse_fill(response: Any, label: str) -> bool:
-    if response is None: return False
-    if isinstance(response, dict):
-        status  = str(response.get("status", "")).upper()
-        matched = float(response.get("size_matched", 0) or 0)
-        return status in ("MATCHED", "FILLED") and matched > 0
-    if hasattr(response, "status"):
-        status  = str(getattr(response, "status", "")).upper()
-        matched = float(getattr(response, "size_matched", 0) or 0)
-        return status in ("MATCHED", "FILLED") and matched > 0
-    return False
+    """
+    Same real-response-shape bug core/execution.py's _parse_fill_status()
+    had before it was fixed: post_order()'s response for a matched FOK has
+    NO "size_matched" key — it reports takingAmount/makingAmount plus a
+    "success" flag instead. Confirmed against a real exit fill (status=
+    'matched', success=True, real transactionsHashes) that this function
+    logged as "FOK rejected" — the position was actually closed on-chain
+    while open_positions kept showing it open. Fixed to match.
+    """
+    if response is None:
+        return False
+    data = response if isinstance(response, dict) else {
+        "status":       getattr(response, "status", None),
+        "success":      getattr(response, "success", None),
+        "size_matched": getattr(response, "size_matched", None),
+        "takingAmount": getattr(response, "takingAmount", None),
+        "makingAmount": getattr(response, "makingAmount", None),
+    }
+    if not isinstance(data, dict):
+        return False
+
+    status  = str(data.get("status", "")).upper()
+    success = data.get("success")
+
+    matched = data.get("size_matched")
+    if matched is None:
+        matched = data.get("takingAmount") or data.get("makingAmount")
+    try:
+        matched = float(matched) if matched is not None else 0.0
+    except (TypeError, ValueError):
+        matched = 0.0
+
+    return status in ("MATCHED", "FILLED") and success is not False and matched > 0
 
 
 class PositionMonitor:
@@ -452,7 +476,14 @@ class PositionMonitor:
         )
 
         # Order amount: market SELL amount = shares (Polymarket docs).
-        order_amount = round(shares_held, 2)
+        # shares_held = size_usd / entry_price is a re-derived approximation
+        # of what was actually filled at entry (the real matched quantity
+        # isn't stored) — round-to-nearest could round UP past the true
+        # owned balance. Confirmed against real rejections: e.g. balance=
+        # 1538460, order_amount=1540000 — a rounding-up excess of exactly
+        # the kind math.floor prevents. Always round DOWN so a sell order
+        # never requests more shares than are actually held.
+        order_amount = math.floor(shares_held * 100) / 100
 
         try:
             signed = self.client.create_market_order(MarketOrderArgs(
