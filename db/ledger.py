@@ -87,6 +87,7 @@ class Ledger:
                 CREATE TABLE IF NOT EXISTS token_matrix (
                     bracket_label   TEXT    PRIMARY KEY,
                     token_id        TEXT    NOT NULL,
+                    no_token_id     TEXT    NOT NULL DEFAULT '',
                     market_date     TEXT    NOT NULL,
                     updated_at      TEXT    NOT NULL
                 );
@@ -125,7 +126,8 @@ class Ledger:
         with self._conn() as conn:
             for table, col in [("calibration_logs", "market_date"),
                                 ("exit_log", "market_date"),
-                                ("open_positions", "market_date")]:
+                                ("open_positions", "market_date"),
+                                ("token_matrix", "no_token_id")]:
                 cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})")]
                 if col not in cols:
                     logger.info(f"[LEDGER] Migrating: adding {col} to {table}")
@@ -239,23 +241,30 @@ class Ledger:
 
     # ── Token matrix (refreshed daily by discovery job) ──────────────────────
 
-    def upsert_token_matrix(self, bracket_label: str, token_id: str, market_date: str):
+    def upsert_token_matrix(
+        self, bracket_label: str, token_id: str, no_token_id: str, market_date: str,
+    ):
         ts = datetime.datetime.utcnow().isoformat()
         with self._conn() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO token_matrix "
-                "(bracket_label, token_id, market_date, updated_at) "
-                "VALUES (?, ?, ?, ?)",
-                (bracket_label, token_id, market_date, ts),
+                "(bracket_label, token_id, no_token_id, market_date, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (bracket_label, token_id, no_token_id, market_date, ts),
             )
 
-    def get_token_matrix(self, market_date: str) -> Dict[str, str]:
+    def get_token_matrix(self, market_date: str) -> Dict[str, Dict[str, str]]:
+        """Returns {bracket_label: {"yes": token_id, "no": no_token_id}}."""
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT bracket_label, token_id FROM token_matrix WHERE market_date = ?",
+                "SELECT bracket_label, token_id, no_token_id FROM token_matrix "
+                "WHERE market_date = ?",
                 (market_date,),
             ).fetchall()
-        return {r["bracket_label"]: r["token_id"] for r in rows}
+        return {
+            r["bracket_label"]: {"yes": r["token_id"], "no": r["no_token_id"]}
+            for r in rows
+        }
 
     # ── Positions ─────────────────────────────────────────────────────────────
 

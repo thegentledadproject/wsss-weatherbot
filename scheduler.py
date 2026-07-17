@@ -56,7 +56,7 @@ Jobs (all times SGT, all 24/7 unless noted):
 
 State shared across jobs (in-process dict, not DB):
   _state = {
-      "token_matrix":  {label: token_id},
+      "token_matrix":  {label: {"yes": token_id, "no": no_token_id}},
       "signals":       {label: EdgeSignal},
       "forecast":      ForecastResult,
       "model_probs":   {label: float},
