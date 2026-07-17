@@ -141,16 +141,22 @@ class MarketDiscovery:
         self.ledger  = ledger
         self.timeout = timeout
 
-    def run(self) -> Dict[str, Dict[str, str]]:
+    def run(self, date: Optional[str] = None, quiet: bool = False) -> Dict[str, Dict[str, str]]:
         """
         Main entry point. Returns {bracket_label: {"yes": token_id, "no": no_token_id}}
-        for today. Writes results to DB. Falls back to last known DB matrix if
-        API fails entirely.
-        """
-        today = _today_str()
-        logger.info(f"[DISCOVERY] Running market discovery for {today}")
+        for the given date (defaults to today's SGT date). Writes results to
+        DB. Falls back to last known DB matrix if API fails entirely.
 
-        token_matrix = self._fetch_from_gamma(today)
+        quiet: suppress the WARNING/ERROR fallback logging. Used for
+        speculative "is tomorrow's market live yet?" lookahead probes, where
+        a miss is the normal, expected outcome for ~20 hours a day — not
+        something to surface loudly every 20-min Job 1 tick.
+        """
+        if date is None:
+            date = _today_str()
+        logger.info(f"[DISCOVERY] Running market discovery for {date}")
+
+        token_matrix = self._fetch_from_gamma(date)
 
         if token_matrix:
             logger.info(
@@ -159,17 +165,19 @@ class MarketDiscovery:
                             for k, v in token_matrix.items())
             )
             for label, ids in token_matrix.items():
-                self.ledger.upsert_token_matrix(label, ids["yes"], ids["no"], today)
+                self.ledger.upsert_token_matrix(label, ids["yes"], ids["no"], date)
         else:
-            logger.warning(
+            log_miss = logger.info if quiet else logger.warning
+            log_miss(
                 "[DISCOVERY] Gamma API returned no results via slug or browse — "
                 "falling back to last known token matrix in DB."
             )
-            token_matrix = self.ledger.get_token_matrix(today)
+            token_matrix = self.ledger.get_token_matrix(date)
             if not token_matrix:
-                slugs = _build_slugs(today)
-                logger.error(
-                    f"[DISCOVERY] No token matrix available for {today}. "
+                slugs = _build_slugs(date)
+                log_fail = logger.info if quiet else logger.error
+                log_fail(
+                    f"[DISCOVERY] No token matrix available for {date}. "
                     f"Tried event slugs {slugs} (query + path form) and paginated "
                     f"browse+filter. Market may not have launched yet, or the slug "
                     f"format has changed. Job 2 will skip until discovery succeeds."
@@ -318,19 +326,23 @@ class MarketDiscovery:
 
         return {}
 
-    def validate_against_live(self, token_matrix: Dict[str, Dict[str, str]]) -> bool:
+    def validate_against_live(
+        self, token_matrix: Dict[str, Dict[str, str]], date: Optional[str] = None,
+    ) -> bool:
         """
-        Confirm stored token IDs still appear in today's live event.
+        Confirm stored token IDs still appear in the live event for `date`
+        (defaults to today's SGT date — pass the actual date being traded,
+        e.g. tomorrow's, if Job 1's lookahead is already trading it).
         Returns False and logs ALERT if any token has been removed or changed.
-        Re-fetches today's event by slug and compares embedded token IDs.
         Only the YES ids are compared — this is just a "market still live"
         sanity check, not a full reconciliation of both sides.
         """
         if not token_matrix:
             return False
 
-        today = _today_str()
-        slugs = _build_slugs(today)
+        if date is None:
+            date = _today_str()
+        slugs = _build_slugs(date)
         live: Dict[str, Dict[str, str]] = {}
         try:
             for slug in slugs:
