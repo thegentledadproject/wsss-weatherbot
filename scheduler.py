@@ -142,29 +142,42 @@ def _sg_now() -> datetime.datetime:
 def job_market_discovery():
     sg_now = _sg_now()
     date   = sg_now.strftime("%Y-%m-%d")
-    prior_date = _state.get("market_date", "")
+    prior_date  = _state.get("market_date", "")
+    is_rollover = bool(prior_date) and prior_date != date
 
     logger.info(f"[JOB1] ── Market Discovery @ {sg_now.strftime('%H:%M SGT')} ──────")
 
-    if prior_date and prior_date != date:
+    if is_rollover:
         logger.info(f"[JOB1] Date rollover detected: {prior_date} → {date}")
 
     discovery = MarketDiscovery(_ledger)
     matrix    = discovery.run()
 
     if not matrix:
-        # Not an error on every tick — this runs every 20 min now, so a miss
-        # just means retry in 20 min rather than a ~24h gap under the old
-        # once-daily schedule. Only escalate to ERROR if we ALSO have no
-        # matrix already cached in _state (i.e. Jobs 2/3 would have nothing
-        # at all to work with).
-        if _state.get("token_matrix"):
+        # "Keep the cached matrix and retry in 20 min" is only safe WITHIN
+        # the same calendar day (a transient fetch miss). Once the date has
+        # rolled over, a cached matrix is for YESTERDAY's already-settled
+        # market — reusing it would have Jobs 2/3 silently scanning/trading
+        # a dead market indefinitely (confirmed: this happened for real,
+        # discovery never advanced past a stale prior-day matrix). So a
+        # rollover always clears the cache and updates market_date below,
+        # even when today's real event hasn't been found yet — Jobs 2/3
+        # correctly see "no matrix" and skip until discovery catches up.
+        if _state.get("token_matrix") and not is_rollover:
             logger.warning(
                 "[JOB1] No fresh tokens found this cycle — keeping previously "
                 "cached matrix until next retry."
             )
             return
-        logger.error("[JOB1] No tokens found and no cached matrix — Jobs 2/3 will skip.")
+        if is_rollover:
+            logger.error(
+                f"[JOB1] Date rolled over to {date} but today's market isn't "
+                f"discoverable yet — clearing stale {prior_date} matrix. "
+                f"Jobs 2/3 will skip until discovery succeeds for {date}."
+            )
+        else:
+            logger.error("[JOB1] No tokens found and no cached matrix — Jobs 2/3 will skip.")
+        matrix = {}
     else:
         # Validate discovered tokens against live Gamma
         valid = discovery.validate_against_live(matrix)
@@ -187,6 +200,13 @@ def job_signal_scan():
     token_matrix = _state.get("token_matrix", {})
     if not token_matrix:
         logger.warning("[JOB2] No token matrix — skipping scan. Run Job 1 first.")
+        # Clear any signals left over from a prior cycle — without this,
+        # Job 3 would keep reading yesterday's already-actionable signals
+        # (dead token ids on a now-settled market) straight through a date
+        # rollover, since it trusts _state["signals"] with no cross-check
+        # against token_matrix/market_date. Matches the other two early
+        # returns below, which already clear signals for the same reason.
+        _state["signals"] = {}
         return
 
     # Fetch live GFS forecast (ensemble sigma)
