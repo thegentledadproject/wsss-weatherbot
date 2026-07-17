@@ -466,7 +466,10 @@ def exit_reasons():
 
 @app.get("/api/open_positions")
 def open_positions():
-    """All currently open positions with live trail/stop levels."""
+    """All currently open positions with live trail/stop levels, current
+    market value, and unrealised P&L."""
+    from core.edge import fetch_market_price
+
     rows = _rows("SELECT * FROM open_positions ORDER BY opened_at ASC")
     trail_pct   = float(os.getenv("TRAIL_PCT", 0.20))
     edge_thresh = float(os.getenv("EDGE_THRESHOLD", 0.05))
@@ -474,8 +477,10 @@ def open_positions():
         label     = r["bracket_label"]
         direction = "NO" if ":NO" in label else "YES"
         entry     = float(r["entry_price"])
+        size_usd  = float(r["size_usd"])
         peak_raw  = r.get("peak_price")
         peak      = float(peak_raw) if peak_raw is not None else entry
+        shares_held = size_usd / entry
         r["direction"]   = direction
         r["trail_pct"]   = trail_pct
         # Both YES and NO positions are tracked by the token actually held
@@ -487,6 +492,30 @@ def open_positions():
         r["trail_level"]  = round(peak * (1 - trail_pct), 5) if peak > entry else None
         r["trail_armed"]  = peak > entry
         r["stop_level"]   = round(entry - edge_thresh, 5)
+        # Config thresholds as percentages — the trailing-stop drawdown is
+        # already scale-free (20% off peak regardless of price level), but
+        # the stop-loss is a fixed price delta (EDGE_THRESHOLD), so express
+        # it relative to entry so it reads the same way ("triggers at -X%").
+        r["profit_taking_pct"] = round(trail_pct * 100, 2)
+        r["stop_loss_pct"]     = round((edge_thresh / entry) * 100, 2) if entry > 0 else None
+
+        # Current market value + unrealised P&L — a fresh price fetch per
+        # position (same call position_monitor.py makes each cycle); a
+        # failure here just falls back to entry (flat, 0% unrealised)
+        # rather than breaking the whole endpoint for one bad lookup.
+        try:
+            live_price = fetch_market_price(r["token_id"])
+            current_price = live_price.mid_price if live_price else entry
+        except Exception as e:
+            logger.warning(f"[DASHBOARD] price fetch failed for {label}: {e}")
+            current_price = entry
+
+        current_value = shares_held * current_price
+        r["current_price"]      = round(current_price, 5)
+        r["current_value"]      = round(current_value, 2)
+        r["unrealized_pnl_usd"] = round(current_value - size_usd, 4)
+        r["unrealized_pnl_pct"] = round(((current_price - entry) / entry) * 100, 2) if entry > 0 else None
+
         # Hold duration
         try:
             opened = datetime.datetime.fromisoformat(r["opened_at"])

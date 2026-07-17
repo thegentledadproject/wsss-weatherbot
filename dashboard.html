@@ -579,27 +579,34 @@ function renderPositions(d) {
     return;
   }
   el.innerHTML = d.positions.map(p => {
-    const label    = p.bracket_label;
-    const bracket  = label.split(":")[0];
-    const dir      = p.direction;
-    const entry    = +p.entry_price;
-    const peak     = +(p.peak_price || entry);
-    const size     = +p.size_usd;
-    const armed    = p.trail_armed;
-    const trail    = p.trail_level;
-    const stop     = p.stop_level;
-    const hours    = p.hold_hours;
+    const label     = p.bracket_label;
+    const bracket   = label.split(":")[0];
+    const dir       = p.direction;
+    const entry     = +p.entry_price;
+    const peak      = +(p.peak_price || entry);
+    const size      = +p.size_usd;
+    const armed     = p.trail_armed;
+    const trail     = p.trail_level;
+    const stop      = p.stop_level;
+    const hours     = p.hold_hours;
+    const value     = p.current_value != null ? +p.current_value : size;
+    const pnlPct    = p.unrealized_pnl_pct;
+    const pnlUsd    = p.unrealized_pnl_usd != null ? +p.unrealized_pnl_usd : 0;
+    const pnlCls    = pnlUsd >= 0 ? "positive" : "negative";
+    const profitPct = p.profit_taking_pct;
+    const stopPct   = p.stop_loss_pct;
     const trailStr = armed && trail
       ? `Trail: ${trail.toFixed(4)}` : "Trail: arming…";
     return `
 <div class="pos-card">
   <div class="pos-top">
     <span class="pos-label">${bracket} · ${dir}</span>
-    <span class="pos-size">$${size.toFixed(2)}</span>
+    <span class="pos-size">$${value.toFixed(2)}</span>
   </div>
   <div class="pos-row">Entry ${entry.toFixed(4)} · Peak ${peak.toFixed(4)} · ${hours}h open</div>
-  <div class="pos-row pos-trail">${trailStr}</div>
-  <div class="pos-row pos-stop">Stop: ${stop ? stop.toFixed(4) : "—"}</div>
+  <div class="pos-row ${pnlCls}">Value $${value.toFixed(2)} (${pnlUsd >= 0 ? "+" : ""}$${pnlUsd.toFixed(4)}${pnlPct != null ? `, ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}%` : ""})</div>
+  <div class="pos-row pos-trail">${trailStr}${profitPct != null ? ` (take-profit ${profitPct.toFixed(0)}%)` : ""}</div>
+  <div class="pos-row pos-stop">Stop: ${stop ? stop.toFixed(4) : "—"}${stopPct != null ? ` (-${stopPct.toFixed(1)}%)` : ""}</div>
 </div>`;
   }).join("");
 }
