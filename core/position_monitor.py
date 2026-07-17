@@ -1,24 +1,24 @@
 """
 core/position_monitor.py — Job 5: Active position monitor
 v4.5: Trailing stop replaces static profit target.
+v4.6: SELL/NO positions are now tracked by the NO token's own token_id
+      (core/execution.py opens them via a real BUY on the NO token, not a
+      synthetic short on YES — see core/edge.py's module docstring). Once
+      the position's own price feed is the token actually held, a NO
+      position behaves exactly like a BUY position (price up = good), so
+      the old direction-specific inverted peak/trail/stop-loss math is no
+      longer needed — `direction` is kept only for labeling/logs.
 
 EXIT CONDITIONS (priority order):
 
   EXIT 1 — TRAILING STOP (replaces static profit target)
-    Mechanism:
-      BUY positions:
-        - Each cycle, if current_mid > stored peak_price → update peak_price
-        - Trailing stop level = peak_price * (1 - TRAIL_PCT)
-        - Exit trigger: current_mid <= trail_level
-        - Meaning: price rose (good), then pulled back TRAIL_PCT from its peak
-        - Default TRAIL_PCT = 0.20 (20% drawdown from peak)
-
-      SELL/NO positions:
-        - Each cycle, if current_mid < stored peak_price → update peak_price
-          (for SELL, "peak" = lowest mid seen, i.e. most profitable point)
-        - Trailing stop level = peak_price * (1 + TRAIL_PCT)
-        - Exit trigger: current_mid >= trail_level
-        - Meaning: YES price fell (good), then bounced back TRAIL_PCT from its low
+    Mechanism (applies uniformly — a NO position is a long position on the
+    NO token, same as a BUY position is a long position on the YES token):
+      - Each cycle, if current_mid > stored peak_price → update peak_price
+      - Trailing stop level = peak_price * (1 - TRAIL_PCT)
+      - Exit trigger: current_mid <= trail_level
+      - Meaning: price rose (good), then pulled back TRAIL_PCT from its peak
+      - Default TRAIL_PCT = 0.20 (20% drawdown from peak)
 
     Why trailing stop > static profit target:
       Static target exits at a fixed price. Trailing stop follows the position
@@ -28,9 +28,8 @@ EXIT CONDITIONS (priority order):
       only if the market reversed — otherwise it would have ridden to 64c+ at
       16:00 time exit, capturing the full move.
 
-  EXIT 2 — STOP LOSS (unchanged)
-    BUY:  mid <= entry_price - EDGE_THRESHOLD  (market moved against entry)
-    SELL: mid >= entry_price + EDGE_THRESHOLD  (YES price rising against our short)
+  EXIT 2 — STOP LOSS
+    mid <= entry_price - EDGE_THRESHOLD  (market moved against entry)
 
   EXIT 3 — TIME EXIT (unchanged)
     16:00 SGT hard close, all positions, best available price.
@@ -50,7 +49,7 @@ from typing import Any, Dict, List, Optional
 
 from py_clob_client_v2.client import ClobClient
 from py_clob_client_v2.clob_types import MarketOrderArgs, OrderType
-from py_clob_client_v2.order_builder.constants import BUY as _CLOB_BUY, SELL as _CLOB_SELL
+from py_clob_client_v2.order_builder.constants import SELL as _CLOB_SELL
 
 from db.ledger import Ledger
 from core.edge import fetch_market_price, MarketPrice
@@ -161,52 +160,33 @@ def evaluate_exit(
 
     mid = market_price.mid_price
 
-    if direction == "BUY":
-        # ── Update peak if new high ────────────────────────────────────────────
-        if mid > peak_price:
-            ledger.update_peak_price(token_id, mid)
-            peak_price = mid
-            logger.info(f"[MONITOR] {label}: new peak = {peak_price:.4f}")
+    # A NO position is tracked by the NO token's own token_id (see module
+    # docstring), so `mid` here already behaves like a normal long position
+    # for both BUY and SELL/NO — no direction-specific inversion needed.
 
-        # ── Trailing stop level ────────────────────────────────────────────────
-        # Only armed once peak is above entry — avoids stopping out immediately
-        # on a position that's never moved in our favour.
-        trail_level = peak_price * (1.0 - trail_pct) if peak_price > entry_price else None
-        trail_trigger = (trail_level is not None) and (mid <= trail_level)
+    # ── Update peak if new high ────────────────────────────────────────────
+    if mid > peak_price:
+        ledger.update_peak_price(token_id, mid)
+        peak_price = mid
+        logger.info(f"[MONITOR] {label}: new peak = {peak_price:.4f}")
 
-        # ── Stop loss ─────────────────────────────────────────────────────────
-        # Independent of trailing stop — fires if market moves against entry
-        # before the trailing stop is armed.
-        stop_trigger = mid <= (entry_price - edge_threshold)
+    # ── Trailing stop level ────────────────────────────────────────────────
+    # Only armed once peak is above entry — avoids stopping out immediately
+    # on a position that's never moved in our favour.
+    trail_level = peak_price * (1.0 - trail_pct) if peak_price > entry_price else None
+    trail_trigger = (trail_level is not None) and (mid <= trail_level)
 
-        trail_str = f"{trail_level:.4f}" if trail_level is not None else "not_armed"
-        logger.info(
-            f"[MONITOR] {label} BUY | mid={mid:.4f} peak={peak_price:.4f} "
-            f"trail_lvl={trail_str} "
-            f"stop_lvl={entry_price-edge_threshold:.4f}"
-        )
+    # ── Stop loss ─────────────────────────────────────────────────────────
+    # Independent of trailing stop — fires if market moves against entry
+    # before the trailing stop is armed.
+    stop_trigger = mid <= (entry_price - edge_threshold)
 
-    else:  # SELL / NO position
-        # ── Update peak if new low (more favourable for SELL) ─────────────────
-        if peak_price == 0.0 or mid < peak_price:
-            ledger.update_peak_price(token_id, mid)
-            peak_price = mid
-            logger.info(f"[MONITOR] {label}: new peak (low) = {peak_price:.4f}")
-
-        # ── Trailing stop level ────────────────────────────────────────────────
-        # Armed once YES price has fallen below entry (we're in profit).
-        trail_level  = peak_price * (1.0 + trail_pct) if peak_price < entry_price else None
-        trail_trigger = (trail_level is not None) and (mid >= trail_level)
-
-        # ── Stop loss ─────────────────────────────────────────────────────────
-        stop_trigger = mid >= (entry_price + edge_threshold)
-
-        trail_str = f"{trail_level:.4f}" if trail_level is not None else "not_armed"
-        logger.info(
-            f"[MONITOR] {label} SELL | mid={mid:.4f} peak(low)={peak_price:.4f} "
-            f"trail_lvl={trail_str} "
-            f"stop_lvl={entry_price+edge_threshold:.4f}"
-        )
+    trail_str = f"{trail_level:.4f}" if trail_level is not None else "not_armed"
+    logger.info(
+        f"[MONITOR] {label} {direction} | mid={mid:.4f} peak={peak_price:.4f} "
+        f"trail_lvl={trail_str} "
+        f"stop_lvl={entry_price-edge_threshold:.4f}"
+    )
 
     if trail_trigger:
         reason = ExitReason.TRAILING_STOP
@@ -260,87 +240,6 @@ def _extract_vwap_bid_by_shares(orderbook: Any, target_shares: float) -> Optiona
             break
         acc_shares += size
         acc_usd    += price * size
-
-    return round(acc_usd / acc_shares, 5) if acc_shares > 0 else None
-
-
-def _extract_vwap_ask_by_shares(orderbook: Any, target_shares: float) -> Optional[float]:
-    """Ask-side counterpart of _extract_vwap_bid_by_shares — see docstring above."""
-    raw_asks = getattr(orderbook, "asks", None)
-    if raw_asks is None:
-        raw_asks = orderbook.get("asks", []) if isinstance(orderbook, dict) else []
-    if not raw_asks:
-        return None
-
-    def _p(a): return float(a.price) if hasattr(a, "price") else float(a.get("price", 0))
-    def _s(a): return float(a.size)  if hasattr(a, "size")  else float(a.get("size",  0))
-
-    acc_usd = acc_shares = 0.0
-    for ask in sorted(raw_asks, key=_p):
-        price, size = _p(ask), _s(ask)
-        if price <= 0:
-            continue
-        if acc_shares + size >= target_shares:
-            remaining   = target_shares - acc_shares
-            acc_usd    += remaining * price
-            acc_shares += remaining
-            break
-        acc_shares += size
-        acc_usd    += price * size
-
-    return round(acc_usd / acc_shares, 5) if acc_shares > 0 else None
-
-
-def _extract_vwap_bid(orderbook: Any, target_usd: float) -> Optional[float]:
-    """VWAP on bid side — for selling YES shares to exit a BUY position."""
-    raw_bids = getattr(orderbook, "bids", None)
-    if raw_bids is None:
-        raw_bids = orderbook.get("bids", []) if isinstance(orderbook, dict) else []
-    if not raw_bids:
-        return None
-
-    def _p(b): return float(b.price) if hasattr(b, "price") else float(b.get("price", 0))
-    def _s(b): return float(b.size)  if hasattr(b, "size")  else float(b.get("size",  0))
-
-    acc_usd = acc_shares = 0.0
-    for bid in sorted(raw_bids, key=_p, reverse=True):
-        price, size = _p(bid), _s(bid)
-        if price <= 0: continue
-        proceeds = price * size
-        if acc_usd + proceeds >= target_usd:
-            remaining     = target_usd - acc_usd
-            acc_shares   += remaining / price
-            acc_usd      += remaining
-            break
-        acc_shares += size
-        acc_usd    += proceeds
-
-    return round(acc_usd / acc_shares, 5) if acc_shares > 0 else None
-
-
-def _extract_vwap_ask(orderbook: Any, target_usd: float) -> Optional[float]:
-    """VWAP on ask side — for buying back YES shares to exit a SELL/NO position."""
-    raw_asks = getattr(orderbook, "asks", None)
-    if raw_asks is None:
-        raw_asks = orderbook.get("asks", []) if isinstance(orderbook, dict) else []
-    if not raw_asks:
-        return None
-
-    def _p(a): return float(a.price) if hasattr(a, "price") else float(a.get("price", 0))
-    def _s(a): return float(a.size)  if hasattr(a, "size")  else float(a.get("size",  0))
-
-    acc_usd = acc_shares = 0.0
-    for ask in sorted(raw_asks, key=_p):
-        price, size = _p(ask), _s(ask)
-        if price <= 0: continue
-        cost = price * size
-        if acc_usd + cost >= target_usd:
-            remaining     = target_usd - acc_usd
-            acc_shares   += remaining / price
-            acc_usd      += remaining
-            break
-        acc_shares += size
-        acc_usd    += cost
 
     return round(acc_usd / acc_shares, 5) if acc_shares > 0 else None
 
@@ -537,12 +436,11 @@ class PositionMonitor:
         # the market offers now — so we must walk the book by SHARE target.
         shares_held = size_usd / decision.entry_price
 
-        if direction == "BUY":
-            exit_vwap = _extract_vwap_bid_by_shares(book, shares_held)
-            clob_side = _CLOB_SELL
-        else:
-            exit_vwap = _extract_vwap_ask_by_shares(book, shares_held)
-            clob_side = _CLOB_BUY
+        # Every open position (BUY/YES or SELL/NO) is a plain long on the
+        # token stored in open_positions.token_id (see module docstring) —
+        # closing it always means selling that exact share count into the bid.
+        exit_vwap = _extract_vwap_bid_by_shares(book, shares_held)
+        clob_side = _CLOB_SELL
 
         if exit_vwap is None:
             logger.warning(f"[MONITOR] {label}: no book depth — retry next cycle")
@@ -553,15 +451,8 @@ class PositionMonitor:
             f"shares_held={shares_held:.4f}"
         )
 
-        # ── Order amount units confirmed from Polymarket docs (same rule as
-        # core/execution.py): market SELL amount = shares, market BUY amount = USD.
-        #   BUY  position exit → SELL order → amount = shares_held (shares)
-        #   SELL position exit → BUY  order → amount = shares_held * exit_vwap (USD
-        #                        needed to buy back exactly shares_held shares now)
-        if direction == "BUY":
-            order_amount = round(shares_held, 2)
-        else:
-            order_amount = round(shares_held * exit_vwap, 2)
+        # Order amount: market SELL amount = shares (Polymarket docs).
+        order_amount = round(shares_held, 2)
 
         try:
             signed = self.client.create_market_order(MarketOrderArgs(
@@ -574,10 +465,7 @@ class PositionMonitor:
             return self._result(decision, size_usd, opened_at, exit_vwap, False, f"order_error:{e}")
 
         if filled:
-            if direction == "BUY":
-                realised_pnl = (exit_vwap - decision.entry_price) * shares_held
-            else:
-                realised_pnl = (decision.entry_price - exit_vwap) * shares_held
+            realised_pnl = (exit_vwap - decision.entry_price) * shares_held
 
             logger.info(
                 f"[MONITOR] ✓ {label} [{direction}] FILLED "

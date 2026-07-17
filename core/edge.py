@@ -15,10 +15,15 @@ Direction logic:
   edge < -threshold → SELL YES = BUY NO  (market over-pricing outcome)
   |edge| < threshold → no trade
 
-For NO trades (SELL YES):
-  Polymarket allows selling YES shares you don't own (short).
-  Execution uses Side.SELL on the YES token at the bid price.
-  Kelly math for NO: effective_ask = 1 - best_bid (cost to buy NO = 1 - bid)
+For NO trades (direction="SELL"):
+  Polymarket's CLOB requires holding a token to sell it — there is no naked
+  short-sell endpoint (confirmed: the UI itself only exposes Buy Yes/Buy No).
+  A NO position is opened and closed by trading the NO outcome token
+  directly (its own separate token_id), via a normal BUY to open / SELL to
+  close — mechanically identical to a YES position, just on the other token.
+  Kelly math for NO still uses effective_ask = 1 - best_bid (from the YES
+  book) as a sizing estimate; execution fetches the NO token's own live book
+  for the actual order.
   NO position pays $1 if outcome does NOT occur.
 
 Edge threshold: 5% (0.05) — set in .env as EDGE_THRESHOLD
@@ -103,9 +108,11 @@ class EdgeSignal:
         edge:           float,
         edge_threshold: float,
         gate_reason:    str = "",
+        no_token_id:    Optional[str] = None,
     ):
         self.bracket_label  = bracket_label
         self.token_id       = token_id
+        self.no_token_id    = no_token_id
         self.model_prob     = model_prob
         self.market_price   = market_price
         self.edge           = edge
@@ -284,6 +291,7 @@ def compute_edge(
     edge_threshold: float = EDGE_THRESHOLD,
     min_liquidity_usd: float = 10.0,
     max_edge_magnitude: float = MAX_EDGE_MAGNITUDE,
+    no_token_id: Optional[str] = None,
 ) -> EdgeSignal:
     """
     Compute edge for one bracket. Always returns EdgeSignal (never None).
@@ -308,6 +316,7 @@ def compute_edge(
             model_prob=model_prob, market_price=None,
             edge=0.0, edge_threshold=edge_threshold,
             gate_reason=ACTION_NO_PRICE,
+            no_token_id=no_token_id,
         )
 
     edge = model_prob - market_price.mid_price
@@ -324,6 +333,7 @@ def compute_edge(
             model_prob=model_prob, market_price=market_price,
             edge=edge, edge_threshold=edge_threshold,
             gate_reason=ACTION_SKIP_EXTREME,
+            no_token_id=no_token_id,
         )
 
     # Liquidity gate — blocks two cases:
@@ -342,6 +352,7 @@ def compute_edge(
             model_prob=model_prob, market_price=market_price,
             edge=edge, edge_threshold=edge_threshold,
             gate_reason=ACTION_SKIP_LIQ,
+            no_token_id=no_token_id,
         )
     if market_price.liquidity_usd < min_liquidity_usd:
         logger.info(
@@ -353,6 +364,7 @@ def compute_edge(
             model_prob=model_prob, market_price=market_price,
             edge=edge, edge_threshold=edge_threshold,
             gate_reason=ACTION_SKIP_LIQ,
+            no_token_id=no_token_id,
         )
 
     # Spread gate
@@ -365,6 +377,7 @@ def compute_edge(
             model_prob=model_prob, market_price=market_price,
             edge=edge, edge_threshold=edge_threshold,
             gate_reason=ACTION_SKIP_SPRD,
+            no_token_id=no_token_id,
         )
 
     signal = EdgeSignal(
@@ -375,25 +388,27 @@ def compute_edge(
         edge           = edge,
         edge_threshold = edge_threshold,
         gate_reason    = "",
+        no_token_id    = no_token_id,
     )
     logger.info(str(signal))
     return signal
 
 
 def scan_all_brackets(
-    token_matrix: Dict[str, str],
+    token_matrix: Dict[str, Dict[str, str]],
     model_probs: Dict[str, float],
     edge_threshold: float = EDGE_THRESHOLD,
     max_edge_magnitude: float = MAX_EDGE_MAGNITUDE,
 ) -> Dict[str, EdgeSignal]:
     """
     Run edge calculation across all brackets in token_matrix.
+    token_matrix: {bracket_label: {"yes": token_id, "no": no_token_id}}.
     Returns {bracket_label: EdgeSignal} for every bracket
     where a price was successfully fetched.
     """
     signals: Dict[str, EdgeSignal] = {}
 
-    for label, token_id in token_matrix.items():
+    for label, ids in token_matrix.items():
         model_prob = model_probs.get(label)
         if model_prob is None:
             logger.warning(f"[EDGE] No model prob for {label} — skipping")
@@ -401,10 +416,11 @@ def scan_all_brackets(
 
         signals[label] = compute_edge(
             bracket_label       = label,
-            token_id            = token_id,
+            token_id            = ids["yes"],
             model_prob          = model_prob,
             edge_threshold      = edge_threshold,
             max_edge_magnitude  = max_edge_magnitude,
+            no_token_id         = ids.get("no") or None,
         )
 
     actionable = [l for l, s in signals.items() if s.actionable]

@@ -110,9 +110,14 @@ def _build_slugs(date_str: str) -> List[str]:
         slugs.append(f"{base}-{mon_l}-{day_pad}-{year}")
     return slugs
 
-def _extract_markets_from_event(event: dict) -> Dict[str, str]:
-    """Given one event object, extract {bracket_label: token_id} from its embedded markets."""
-    found: Dict[str, str] = {}
+def _extract_markets_from_event(event: dict) -> Dict[str, Dict[str, str]]:
+    """
+    Given one event object, extract {bracket_label: {"yes": yes_id, "no": no_id}}
+    from its embedded markets. clobTokenIds is conventionally [yes_id, no_id] —
+    the NO id is needed to open/close NO positions via a real BUY on the NO
+    token, rather than a naked (and unsupported) sell of YES.
+    """
+    found: Dict[str, Dict[str, str]] = {}
     for market in event.get("markets", []):
         question = market.get("question", "") or market.get("title", "") \
                    or market.get("groupItemTitle", "")
@@ -120,8 +125,14 @@ def _extract_markets_from_event(event: dict) -> Dict[str, str]:
         if not label:
             continue
         token_ids = _parse_clob_token_ids(market)
-        if token_ids:
-            found[label] = token_ids[0]
+        if len(token_ids) >= 2:
+            found[label] = {"yes": token_ids[0], "no": token_ids[1]}
+        elif token_ids:
+            logger.warning(
+                f"[DISCOVERY] {label}: only {len(token_ids)} clobTokenIds — "
+                f"no NO token id available, SELL/NO trades will be skipped for it"
+            )
+            found[label] = {"yes": token_ids[0], "no": ""}
     return found
 
 
@@ -130,10 +141,11 @@ class MarketDiscovery:
         self.ledger  = ledger
         self.timeout = timeout
 
-    def run(self) -> Dict[str, str]:
+    def run(self) -> Dict[str, Dict[str, str]]:
         """
-        Main entry point. Returns {bracket_label: token_id} for today.
-        Writes results to DB. Falls back to last known DB matrix if API fails entirely.
+        Main entry point. Returns {bracket_label: {"yes": token_id, "no": no_token_id}}
+        for today. Writes results to DB. Falls back to last known DB matrix if
+        API fails entirely.
         """
         today = _today_str()
         logger.info(f"[DISCOVERY] Running market discovery for {today}")
@@ -143,10 +155,11 @@ class MarketDiscovery:
         if token_matrix:
             logger.info(
                 f"[DISCOVERY] Found {len(token_matrix)} brackets: "
-                + ", ".join(f"{k}={v[:10]}..." for k, v in token_matrix.items())
+                + ", ".join(f"{k}=yes:{v['yes'][:10]}.. no:{v['no'][:10] or 'MISSING'}.."
+                            for k, v in token_matrix.items())
             )
-            for label, token_id in token_matrix.items():
-                self.ledger.upsert_token_matrix(label, token_id, today)
+            for label, ids in token_matrix.items():
+                self.ledger.upsert_token_matrix(label, ids["yes"], ids["no"], today)
         else:
             logger.warning(
                 "[DISCOVERY] Gamma API returned no results via slug or browse — "
@@ -164,7 +177,7 @@ class MarketDiscovery:
 
         return token_matrix
 
-    def _fetch_from_gamma(self, today: str) -> Dict[str, str]:
+    def _fetch_from_gamma(self, today: str) -> Dict[str, Dict[str, str]]:
         """
         Three-stage fetch, in order of speed/reliability:
           1. GET /events?slug=<slug>   (query-param form — confirmed correct resource)
@@ -204,7 +217,7 @@ class MarketDiscovery:
 
         return {}
 
-    def _fetch_by_slug_query(self, slug: str) -> Dict[str, str]:
+    def _fetch_by_slug_query(self, slug: str) -> Dict[str, Dict[str, str]]:
         """GET /events?slug=<slug> — the documented, confirmed-correct resource."""
         logger.info(f"[DISCOVERY] Trying /events?slug={slug}")
         resp = requests.get(GAMMA_EVENTS_URL, params={"slug": slug}, timeout=self.timeout)
@@ -212,12 +225,12 @@ class MarketDiscovery:
         data = resp.json()
 
         events = data if isinstance(data, list) else data.get("events", [data] if data else [])
-        found: Dict[str, str] = {}
+        found: Dict[str, Dict[str, str]] = {}
         for event in events:
             found.update(_extract_markets_from_event(event))
         return found
 
-    def _fetch_by_slug_path(self, slug: str) -> Dict[str, str]:
+    def _fetch_by_slug_path(self, slug: str) -> Dict[str, Dict[str, str]]:
         """GET /events/slug/<slug> — path-style variant, single event object returned."""
         url = f"{GAMMA_EVENTS_URL}/slug/{slug}"
         logger.info(f"[DISCOVERY] Trying {url}")
@@ -230,7 +243,7 @@ class MarketDiscovery:
             return {}
         return _extract_markets_from_event(event)
 
-    def _browse_and_filter(self, today: str, max_pages: int = 4) -> Dict[str, str]:
+    def _browse_and_filter(self, today: str, max_pages: int = 4) -> Dict[str, Dict[str, str]]:
         """
         Last resort: paginate active events and filter client-side.
         No server-side search dependency — Gamma's ?q= parameter is not
@@ -305,18 +318,20 @@ class MarketDiscovery:
 
         return {}
 
-    def validate_against_live(self, token_matrix: Dict[str, str]) -> bool:
+    def validate_against_live(self, token_matrix: Dict[str, Dict[str, str]]) -> bool:
         """
         Confirm stored token IDs still appear in today's live event.
         Returns False and logs ALERT if any token has been removed or changed.
         Re-fetches today's event by slug and compares embedded token IDs.
+        Only the YES ids are compared — this is just a "market still live"
+        sanity check, not a full reconciliation of both sides.
         """
         if not token_matrix:
             return False
 
         today = _today_str()
         slugs = _build_slugs(today)
-        live: Dict[str, str] = {}
+        live: Dict[str, Dict[str, str]] = {}
         try:
             for slug in slugs:
                 live = self._fetch_by_slug_query(slug)
@@ -335,8 +350,8 @@ class MarketDiscovery:
             logger.warning("[DISCOVERY] Validation found no live event — skipping check.")
             return True
 
-        live_ids  = set(live.values())
-        local_ids = set(token_matrix.values())
+        live_ids  = {ids["yes"] for ids in live.values()}
+        local_ids = {ids["yes"] for ids in token_matrix.values()}
 
         if not local_ids.issubset(live_ids):
             missing = local_ids - live_ids
