@@ -36,7 +36,9 @@ logger = logging.getLogger("hermes.dashboard_api")
 logging.basicConfig(level=logging.INFO)
 
 DB_PATH      = os.getenv("DB_PATH", "hermes.db")
-VAULT_START  = float(os.getenv("MAX_VAULT_ALLOCATION", 200.0))
+# Starting-capital baseline for the P&L/ROI display only — position sizing
+# no longer uses this (Kelly/vault sizing is disabled; see scheduler.py).
+STARTING_CAPITAL = float(os.getenv("MAX_VAULT_ALLOCATION", 200.0))
 _DASHBOARD_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
 
 # ── Upstream (Open-Meteo GFS/ECMWF) health check cache ───────────────────────
@@ -143,7 +145,7 @@ def status():
     return {
         "live":       live,
         "db_path":    DB_PATH,
-        "vault_start": VAULT_START,
+        "starting_capital": STARTING_CAPITAL,
         "sgt_now":    sg.strftime("%Y-%m-%d %H:%M SGT"),
         "utc_now":    datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
     }
@@ -338,10 +340,10 @@ def kpis():
     )
     losses       = total_trades - wins
     win_rate     = (wins / total_trades * 100) if total_trades else 0.0
-    roi          = (net_pnl / VAULT_START * 100) if VAULT_START else 0.0
+    roi          = (net_pnl / STARTING_CAPITAL * 100) if STARTING_CAPITAL else 0.0
     return {
-        "vault_current":  round(VAULT_START + net_pnl, 2),
-        "vault_start":    VAULT_START,
+        "capital_current": round(STARTING_CAPITAL + net_pnl, 2),
+        "starting_capital": STARTING_CAPITAL,
         "net_pnl":        round(net_pnl, 4),
         "roi_pct":        round(roi, 2),
         "total_trades":   int(total_trades),
@@ -358,17 +360,17 @@ def kpis():
 
 @app.get("/api/equity")
 def equity():
-    """Cumulative vault equity per closed trade."""
+    """Cumulative P&L equity curve per closed trade, starting from STARTING_CAPITAL."""
     rows = _rows(
         "SELECT id, bracket_label, direction, reason, "
         "entry_price, exit_price, size_usd, realised_pnl, closed_at "
         "FROM exit_log ORDER BY id ASC"
     )
-    running = VAULT_START
+    running = STARTING_CAPITAL
     for r in rows:
         running += r["realised_pnl"]
-        r["vault"] = round(running, 4)
-    return {"vault_start": VAULT_START, "trades": rows}
+        r["equity"] = round(running, 4)
+    return {"starting_capital": STARTING_CAPITAL, "trades": rows}
 
 @app.get("/api/signals")
 def signals(limit: int = 80):

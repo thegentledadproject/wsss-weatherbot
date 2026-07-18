@@ -99,24 +99,22 @@ from db.ledger       import Ledger
 from core.discovery  import MarketDiscovery
 from core.model      import BracketModel, fetch_gfs_forecast
 from core.edge       import scan_all_brackets
-from core.sizing     import compute_size, compute_validation_size, check_sizing_config
+
+# Kelly/vault sizing (compute_size, check_sizing_config, KELLY_FRACTION,
+# MAX_POSITION_PCT, MIN_POSITION_USD) still lives in core/sizing.py but is no
+# longer wired in below — every actionable signal now trades at a fixed USD
+# size via compute_validation_size() instead of being sized against a vault
+# balance. Re-import compute_size/check_sizing_config here to re-enable it.
+from core.sizing     import compute_validation_size
 from core.execution  import ExecutionEngine, build_client
 from core.settlement    import SettlementEngine
 from core.position_monitor import PositionMonitor
 
 # ── Config from environment ────────────────────────────────────────────────────
 DB_PATH       = os.getenv("DB_PATH",              "hermes.db")
-VAULT_USD     = float(os.getenv("MAX_VAULT_ALLOCATION") or 200.0)
 EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", 0.05))
 MAX_EDGE_MAGNITUDE = float(os.getenv("MAX_EDGE_MAGNITUDE", 0.50))
 TRAIL_PCT      = float(os.getenv("TRAIL_PCT", 0.20))
-
-# VALIDATION_MODE: forces $1 trades on any actionable signal, bypassing
-# Kelly sizing and EV hurdles entirely. Full lifecycle (entry, trailing
-# stop, stop loss, settlement) still runs for real — only sizing/gating
-# is bypassed. Use to prove mechanics work before deploying real capital.
-# Set VALIDATION_MODE=false in .env once validation run is complete.
-VALIDATION_MODE = os.getenv("VALIDATION_MODE", "false").lower() == "true"
 ICAO          = "WSSS"
 
 # ── Shared state ───────────────────────────────────────────────────────────────
@@ -309,50 +307,41 @@ def job_order_execution():
         logger.info("[JOB3] No actionable signals this cycle.")
         return
 
-    trailing_bias = _ledger.fetch_trailing_bias(ICAO)
-    engine        = ExecutionEngine(_client, _ledger, VAULT_USD, ICAO)
+    engine = ExecutionEngine(_client, _ledger, 0.0, ICAO)  # vault_usd unused (Kelly/vault sizing disabled)
 
     for label, signal in actionable.items():
         direction = signal.direction  # "BUY" or "SELL"
 
-        # For BUY YES: Kelly uses best_ask (cost to buy)
-        # For SELL YES (NO): Kelly uses effective_ask = 1 - best_bid
+        # effective_ask kept for logging/EV visibility even though sizing no
+        # longer depends on it (fixed-$ sizing below doesn't need a bankroll-
+        # relative bet size, just the win probability implied by the price).
+        # For BUY YES: best_ask (cost to buy)
+        # For SELL YES (NO): effective_ask = 1 - best_bid
         #   because buying NO at implied price (1 - bid) is what we're sizing.
         #   e.g. 33°C bid=0.20 → effective_ask for NO = 1 - 0.20 = 0.80
-        #   Kelly then sizes correctly for a position that pays $1 if 33°C does NOT occur.
         if direction == "BUY":
             effective_ask = signal.market_price.best_ask
         else:
             effective_ask = 1.0 - signal.market_price.best_bid
 
         # signal.model_prob is always P(bracket occurs) — i.e. P(YES).
-        # Kelly's p must be the win probability of the SIDE BEING SIZED:
+        # win_prob must be the win probability of the SIDE BEING SIZED:
         #   BUY YES → wins if the bracket occurs         → p = model_prob
         #   SELL/NO → wins if the bracket does NOT occur  → p = 1 - model_prob
-        # Previously model_prob was passed unflipped for SELL too, which fed
-        # Kelly/EV the probability of the side we're betting AGAINST — e.g. a
-        # NO trade priced favorably (effective_ask cheap) with a small
-        # model_prob scored as strongly net-negative instead of net-positive,
-        # so genuinely strong NO edges could be silently HOLD'd at the net-EV
-        # hurdle before ever reaching execution.
         win_prob = signal.model_prob if direction == "BUY" else 1.0 - signal.model_prob
 
-        if VALIDATION_MODE:
-            sizing = compute_validation_size(
-                model_prob = win_prob,
-                market_ask = effective_ask,
-                direction  = direction,
-            )
-            logger.warning(f"[JOB3] ⚠️  VALIDATION_MODE — {label} [{direction}]: {sizing}")
-        else:
-            sizing = compute_size(
-                model_prob    = win_prob,
-                market_ask    = effective_ask,
-                vault_usd     = VAULT_USD,
-                direction     = direction,
-                trailing_bias = trailing_bias,
-            )
-            logger.info(f"[JOB3] {label} [{direction}]: {sizing}")
+        # Fixed-$ sizing (see core.sizing.compute_validation_size): every
+        # actionable signal trades at VALIDATION_POSITION_USD (.env, default
+        # $1.00) regardless of edge magnitude — no Kelly fraction, no vault-
+        # relative cap/floor, no net-EV/fee hurdle. Only core/edge.py's own
+        # gates (threshold, extreme-edge, liquidity, spread) decide whether a
+        # signal is actionable in the first place.
+        sizing = compute_validation_size(
+            model_prob = win_prob,
+            market_ask = effective_ask,
+            direction  = direction,
+        )
+        logger.info(f"[JOB3] {label} [{direction}]: {sizing}")
 
         if sizing.verdict == "EXECUTE":
             market_date_for_entry = _state.get("market_date", _sg_now().strftime("%Y-%m-%d"))
@@ -484,19 +473,16 @@ def job_position_monitor():
 def main():
     global _client
 
+    from core.sizing import VALIDATION_POSITION_USD
+
     logger.info("═" * 60)
     logger.info("  HERMES v4.6 — WSSS Weather Bracket Trader (round-the-clock)")
     logger.info(
-        f"  Vault: ${VAULT_USD:.0f} | Edge threshold: {EDGE_THRESHOLD*100:.0f}% | "
+        f"  Fixed order size: ${VALIDATION_POSITION_USD:.2f} (Kelly/vault sizing disabled) | "
+        f"Edge threshold: {EDGE_THRESHOLD*100:.0f}% | "
         f"Max edge magnitude: {MAX_EDGE_MAGNITUDE*100:.0f}%"
     )
-    if VALIDATION_MODE:
-        logger.warning("  ⚠️  VALIDATION_MODE ACTIVE — all trades forced to $1, EV gating bypassed")
-        logger.warning("  ⚠️  Set VALIDATION_MODE=false in .env to resume normal Kelly sizing")
     logger.info("═" * 60)
-
-    # Warn if vault/cap/floor collapse the sizing range (see sizing.py)
-    check_sizing_config(VAULT_USD)
 
     # Initialise CLOB client once — shared across all jobs
     try:
