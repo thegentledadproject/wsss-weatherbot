@@ -60,10 +60,17 @@ class SettlementEngine:
         self.icao    = icao
         self.timeout = timeout
 
-    def run(self, model_mu: float, market_date: Optional[str] = None) -> Dict:
+    def run(self, model_mu: Optional[float], market_date: Optional[str] = None) -> Dict:
         """
         Main entry point for Job 4.
-        model_mu: the GFS mu used in today's signal (passed from scheduler state)
+        model_mu: the GFS mu actually computed FOR market_date (looked up by
+            date in scheduler._state["model_mu_by_date"], not a single
+            cross-date scalar). None means Job 2 never ran for this exact
+            date this process lifetime (e.g. a restart, or a discovery
+            outage) — Task A (position resolution) still runs regardless,
+            but Task B (calibration write) is skipped rather than logging
+            this date's actual temperature against some OTHER day's
+            forecast, which would corrupt calibration_logs' residual.
         market_date: date string "YYYY-MM-DD", defaults to today SGT
         """
         if market_date is None:
@@ -114,6 +121,12 @@ class SettlementEngine:
         if self.ledger.has_calibration_for_date(self.icao, market_date):
             logger.info(
                 f"[SETTLE] Calibration already logged for {market_date} — skipping Task B."
+            )
+        elif model_mu is None:
+            logger.warning(
+                f"[SETTLE] No model_mu known for {market_date} (Job 2 never ran for "
+                f"this exact date this process lifetime) — skipping calibration write "
+                f"to avoid logging actual temp against a different day's forecast."
             )
         elif abs(model_mu - FALLBACK_MU) < 0.01:
             logger.warning(
