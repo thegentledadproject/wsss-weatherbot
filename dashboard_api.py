@@ -588,11 +588,32 @@ def open_positions():
 
 @app.get("/api/trades")
 def trades(limit: int = 100):
-    """Recent trade history."""
+    """
+    Recent trade history. closed_at/opened_at are stored as raw UTC
+    (db/ledger.py's log_exit()/record_position() both write
+    datetime.utcnow().isoformat()), but the dashboard's "Closed (SGT)"
+    column header — and every other time display in this app — implies
+    SGT. Converting here (not in the frontend) keeps the UTC->SGT
+    conversion in one place, matching how the rest of the backend already
+    computes SGT (scheduler.py's _sg_now() pattern), rather than leaving
+    the frontend to silently display the wrong timezone under a label
+    that says otherwise. Confirmed in production: a trade that closed at
+    00:35 SGT was displaying as the previous UTC calendar day/hour.
+    """
     rows = _rows(
         "SELECT id, closed_at, bracket_label, direction, reason, "
         "entry_price, exit_price, size_usd, realised_pnl, opened_at "
         "FROM exit_log ORDER BY id DESC LIMIT ?",
         (limit,),
     )
+    for r in rows:
+        for field in ("closed_at", "opened_at"):
+            raw = r.get(field)
+            if not raw:
+                continue
+            try:
+                utc_dt = datetime.datetime.fromisoformat(raw)
+                r[field] = (utc_dt + datetime.timedelta(hours=8)).isoformat()
+            except ValueError:
+                pass  # leave malformed/unexpected values untouched rather than crash the endpoint
     return {"trades": rows}
