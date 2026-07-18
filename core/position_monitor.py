@@ -54,6 +54,7 @@ from py_clob_client_v2.order_builder.constants import SELL as _CLOB_SELL
 
 from db.ledger import Ledger
 from core.edge import fetch_market_price, MarketPrice
+from core.execution import _is_ghost_book, VWAP_DRIFT_TOLERANCE
 
 logger = logging.getLogger("hermes.monitor")
 
@@ -443,12 +444,6 @@ class PositionMonitor:
             f"size=${size_usd:.2f}"
         )
 
-        try:
-            book = self.client.get_order_book(token_id)
-        except Exception as e:
-            logger.error(f"[MONITOR] {label}: book fetch failed: {e}")
-            return self._result(decision, size_usd, opened_at, None, False, "book_fetch_failed")
-
         # ── Exact share count to close — NOT size_usd (the original dollar
         # notional). Confirmed bug: walking the book to a size_usd proceeds/
         # cost target (the old behaviour) only approximates the right depth
@@ -459,16 +454,60 @@ class PositionMonitor:
         # trading the EXACT quantity originally opened, at whatever price
         # the market offers now — so we must walk the book by SHARE target.
         shares_held = size_usd / decision.entry_price
+        clob_side   = _CLOB_SELL
+
+        # ── Compute-time VWAP + revalidation, mirroring core/execution.py's
+        # entry-side pattern. Without this, a ghost-book snapshot (bid=0.01/
+        # ask=0.99, py-clob-client issue #180) would produce a wildly wrong
+        # exit_vwap that gets recorded as the real exit_price/realised_pnl
+        # even if the actual FOK fills fine at the true market price —
+        # corrupting P&L bookkeeping rather than just risking a bad fill.
+        try:
+            book_1 = self.client.get_order_book(token_id)
+        except Exception as e:
+            logger.error(f"[MONITOR] {label}: book fetch failed: {e}")
+            return self._result(decision, size_usd, opened_at, None, False, "book_fetch_failed")
+
+        if _is_ghost_book(book_1):
+            logger.error(
+                f"[MONITOR] {label}: ghost book detected at compute-time "
+                f"(get_order_book issue #180) — abort, will retry next cycle"
+            )
+            return self._result(decision, size_usd, opened_at, None, False, "ghost_book_compute")
 
         # Every open position (BUY/YES or SELL/NO) is a plain long on the
         # token stored in open_positions.token_id (see module docstring) —
         # closing it always means selling that exact share count into the bid.
-        exit_vwap = _extract_vwap_bid_by_shares(book, shares_held)
-        clob_side = _CLOB_SELL
-
-        if exit_vwap is None:
-            logger.warning(f"[MONITOR] {label}: no book depth — retry next cycle")
+        exit_vwap_compute = _extract_vwap_bid_by_shares(book_1, shares_held)
+        if exit_vwap_compute is None:
+            logger.warning(f"[MONITOR] {label}: no book depth at compute — retry next cycle")
             return self._result(decision, size_usd, opened_at, None, False, "no_depth")
+
+        try:
+            book_2 = self.client.get_order_book(token_id)
+        except Exception as e:
+            logger.error(f"[MONITOR] {label}: revalidation book fetch failed: {e}")
+            return self._result(decision, size_usd, opened_at, None, False, "book_fetch_failed")
+
+        if _is_ghost_book(book_2):
+            logger.error(
+                f"[MONITOR] {label}: ghost book detected at revalidation "
+                f"(get_order_book issue #180) — abort, will retry next cycle"
+            )
+            return self._result(decision, size_usd, opened_at, None, False, "ghost_book_revalidation")
+
+        exit_vwap = _extract_vwap_bid_by_shares(book_2, shares_held)
+        if exit_vwap is None:
+            logger.warning(f"[MONITOR] {label}: book gone before exit — retry next cycle")
+            return self._result(decision, size_usd, opened_at, None, False, "no_depth")
+
+        drift = abs(exit_vwap - exit_vwap_compute) / exit_vwap_compute
+        if drift > VWAP_DRIFT_TOLERANCE:
+            logger.warning(
+                f"[MONITOR] {label}: exit VWAP drifted {drift:.1%} "
+                f"({exit_vwap_compute:.4f}→{exit_vwap:.4f}) — abort, retry next cycle"
+            )
+            return self._result(decision, size_usd, opened_at, None, False, "vwap_drift")
 
         logger.info(
             f"[MONITOR] {label}: exit VWAP={exit_vwap:.4f} side={clob_side} "

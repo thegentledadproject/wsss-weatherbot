@@ -62,7 +62,16 @@ State shared across jobs (in-process dict, not DB):
       "signals":       {label: EdgeSignal},
       "forecast":      ForecastResult,
       "model_probs":   {label: float},
-      "model_mu":      float,
+      "model_mu_by_date": {market_date_str: float},  # keyed by the SGT date
+                               # each forecast.mu was actually computed for —
+                               # NOT a single overwritten scalar. A single
+                               # "model_mu" slot (pre-fix) got overwritten by
+                               # every Job 2 tick regardless of date, so Job 4
+                               # settling YESTERDAY after a midnight rollover
+                               # (or any day Job 2 never ran) could log actual
+                               # temp against a DIFFERENT day's forecast,
+                               # corrupting calibration_logs residuals. Pruned
+                               # to {today, yesterday} each Job 4 cycle.
       "market_date":   str,   # refreshed every 20 min by Job 1 — rolls over
                                # across SGT midnight automatically, no special-
                                # casing needed elsewhere.
@@ -123,7 +132,7 @@ _state: dict = {
     "signals":      {},
     "forecast":     None,
     "model_probs":  {},
-    "model_mu":     31.5,
+    "model_mu_by_date": {},
     "market_date":  "",
 }
 
@@ -249,7 +258,11 @@ def job_signal_scan():
         return
 
     _state["model_probs"] = model_probs
-    _state["model_mu"]    = forecast.mu
+    # Keyed by market_date (not overwritten across days) so Job 4 can never
+    # accidentally log a settlement residual against a DIFFERENT day's
+    # forecast — see _state's docstring above for the incident this fixes.
+    scan_date = _state.get("market_date", _sg_now().strftime("%Y-%m-%d"))
+    _state["model_mu_by_date"][scan_date] = forecast.mu
 
     # Edge scan: model prob vs live market mid-price
     signals = scan_all_brackets(
@@ -365,7 +378,6 @@ def job_settlement_check():
     logger.info(f"[JOB4] ── Settlement Check @ {sg_now_str} ───────────────────")
 
     engine       = SettlementEngine(_ledger, ICAO)
-    model_mu     = _state.get("model_mu", 31.5)
     today        = _state.get("market_date", _sg_now().strftime("%Y-%m-%d"))
     yesterday    = (datetime.datetime.strptime(today, "%Y-%m-%d")
                      - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
@@ -380,6 +392,15 @@ def job_settlement_check():
     # checks ALL open positions regardless of market_date, so this doubles
     # that polling per cycle — negligible cost, correctness unaffected.
     for market_date in (today, yesterday):
+        # Look up the mu actually computed FOR THIS DATE, not whatever the
+        # most recent Job 2 tick happened to compute — using a single
+        # cross-date scalar here previously risked settling `yesterday` (or
+        # any date Job 2 never ran, e.g. after a restart) against a
+        # different day's forecast, corrupting calibration_logs' residual.
+        # None (date never seen by Job 2 this process lifetime) makes
+        # SettlementEngine.run() skip the calibration write for that date
+        # rather than guessing.
+        model_mu = _state["model_mu_by_date"].get(market_date)
         results = engine.run(model_mu=model_mu, market_date=market_date)
         logger.info(
             f"[JOB4] date={results['date']} "
@@ -388,6 +409,12 @@ def job_settlement_check():
             f"actual_temp={results['actual_temp']} "
             f"calibration={'✓' if results['calibration_logged'] else '✗'}"
         )
+
+    # Prune to {today, yesterday} — model_mu_by_date would otherwise grow by
+    # one entry per calendar day for the life of the process.
+    _state["model_mu_by_date"] = {
+        d: mu for d, mu in _state["model_mu_by_date"].items() if d in (today, yesterday)
+    }
 
 
 
@@ -428,10 +455,18 @@ def job_position_monitor():
         logger.info("[JOB5] No open positions.")
         return
 
+    # model_probs is only used by evaluate_exit() for logging (ExitDecision.
+    # model_prob) — trailing-stop/stop-loss/time-exit math doesn't depend on
+    # it (PositionMonitor.run() already falls back to 0.5 per-bracket via
+    # model_probs.get(label, 0.5)). Must NOT skip the whole monitor cycle
+    # just because Job 2 hasn't populated this yet — Job 2 only runs
+    # 08:00-17:30 SGT, so on a restart during the other ~14h/day this would
+    # leave any already-open position with zero trailing-stop/stop-loss
+    # protection until Job 2's window reopens.
     model_probs = _state.get("model_probs", {})
     if not model_probs:
-        logger.warning("[JOB5] No model probs in state — Job 2 may not have run yet.")
-        return
+        logger.info("[JOB5] No model probs cached yet (Job 2 hasn't run this cycle) — "
+                    "exits still evaluated normally, model_prob logged as 0.5 fallback.")
 
     monitor = PositionMonitor(
         client         = _client,
