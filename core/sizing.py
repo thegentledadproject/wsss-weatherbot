@@ -46,10 +46,10 @@ logger = logging.getLogger("hermes.sizing")
 
 TAKER_FEE_RATE    = 0.02    # Polymarket maker/taker fee
 GAS_COST_USD      = 0.05    # Polygon gas estimate
-MIN_POSITION_USD  = 10.0    # Hard floor
 MAX_POSITION_PCT  = 0.05    # Cap at 5% of vault per trade
 
 # Runtime-configurable via .env — defaults match v4.5 option 2 & 3 fix
+MIN_POSITION_USD  = float(os.getenv("MIN_POSITION_USD", "2.0"))  # Hard floor
 KELLY_FRACTION    = float(os.getenv("KELLY_FRACTION",  "0.50"))  # half Kelly
 _SMALL_POSITION_THRESHOLD = 25.0
 _SMALL_POSITION_EV_HURDLE = float(os.getenv("SMALL_EV_HURDLE", "0.08"))
