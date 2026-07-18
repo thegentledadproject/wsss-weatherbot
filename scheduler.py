@@ -47,12 +47,14 @@ discovery trigger) had three consequences, all now fixed:
      guard (db/ledger.py) makes this idempotent regardless of how many
      times or how many dates are checked per cycle.
 
-Jobs (all times SGT, all 24/7 unless noted):
-  Job 1 — market_discovery   : every 20 min — self-healing token matrix
-  Job 2 — signal_scan        : every 15 min — forecast + edge scan
-  Job 3 — order_execution    : every 15 min (offset +2 min from Job 2)
-  Job 4 — settlement_check   : every 15 min — checks today AND yesterday
-  Job 5 — position_monitor   : every 5 min  — trailing stop/stop loss/time exit
+Jobs (all times SGT):
+  Job 1 — market_discovery   : every 20 min, 01:00-17:00 — self-healing token matrix
+  Job 2 — signal_scan        : every 15 min, 01:00-17:00 — forecast + edge scan
+  Job 3 — order_execution    : every 15 min, 01:00-17:00 (offset +2 min from Job 2)
+  Job 4 — settlement_check   : every 15 min, 01:00-17:00 — checks today AND yesterday
+  Job 5 — position_monitor   : every 5 min, 24/7 — trailing stop/stop loss/time exit/
+                                stuck-position alert (deliberately NOT windowed — risk
+                                management must never stop just because Jobs 1-4 did)
 
 State shared across jobs (in-process dict, not DB):
   _state = {
@@ -307,22 +309,6 @@ def job_order_execution():
         logger.info("[JOB3] No actionable signals this cycle.")
         return
 
-    # Alert on (never silently delete) positions open far longer than
-    # expected. Job 5's own per-position force_time_exit logic already
-    # retries a REAL close every cycle for anything carried over from a
-    # prior market_date — this just makes a position stuck despite those
-    # retries loud instead of invisible. See db/ledger.py's
-    # find_stuck_positions() docstring for the incident this replaced
-    # (silent deletion of two still-open, unmanaged real-money positions).
-    for stuck in _ledger.find_stuck_positions(ttl_hours=28):
-        logger.critical(
-            f"[JOB3] STUCK POSITION: {stuck['bracket_label']} ({stuck['token_id']}) "
-            f"opened_at={stuck['opened_at']} has been open >28h. Job 5 should be "
-            f"retrying its exit every cycle — if this keeps recurring, investigate "
-            f"manually (book depth? repeated FOK rejections? a bug?). Polymarket's "
-            f"own wallet UI still shows these shares as held."
-        )
-
     trailing_bias = _ledger.fetch_trailing_bias(ICAO)
     engine        = ExecutionEngine(_client, _ledger, VAULT_USD, ICAO)
 
@@ -417,10 +403,32 @@ def job_settlement_check():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# JOB 5 — Position Monitor (every 5 min, 08:05–15:55 SGT)
+# JOB 5 — Position Monitor (every 5 min, 24/7 — deliberately NOT restricted to
+# Jobs 1-4's 01:00-17:00 SGT window; see module docstring)
 # ══════════════════════════════════════════════════════════════════════════════
 def job_position_monitor():
     logger.info("[JOB5] ── Position Monitor ───────────────────────────────────")
+
+    # Alert on (never silently delete) positions open far longer than
+    # expected. Runs first, unconditionally — before any early return below
+    # — so it fires every single Job 5 cycle regardless of client/position/
+    # model-prob state, and keeps running 24/7 even though Jobs 1-4 are now
+    # restricted to 01:00-17:00 SGT. This used to live in Job 3, which only
+    # ran the check when there were actionable signals to execute (a gap of
+    # its own) and would now go silent for 8h/day once Jobs 1-4 stop at
+    # 17:00 — moved here so both the alerting and the actual retry-a-real-
+    # close logic (evaluate_exit()'s force_time_exit path, below) stay on
+    # the same always-on cadence. See db/ledger.py's find_stuck_positions()
+    # docstring for the incident this replaced (silent deletion of two
+    # still-open, unmanaged real-money positions).
+    for stuck in _ledger.find_stuck_positions(ttl_hours=28):
+        logger.critical(
+            f"[JOB5] STUCK POSITION: {stuck['bracket_label']} ({stuck['token_id']}) "
+            f"opened_at={stuck['opened_at']} has been open >28h. This job should be "
+            f"retrying its exit every cycle — if this keeps recurring, investigate "
+            f"manually (book depth? repeated FOK rejections? a bug?). Polymarket's "
+            f"own wallet UI still shows these shares as held."
+        )
 
     if _client is None:
         logger.error("[JOB5] CLOB client not initialised — skipping.")
@@ -531,7 +539,17 @@ def main():
     # Explicit timezone for all jobs — avoids UTC fallback on VPS without pytz
     _SGT = "Asia/Singapore"
 
-    # Job 1 — Market discovery: every 20 min, 24/7 — self-healing.
+    # Jobs 1-4 — restricted to 01:00-17:00 SGT (hour="1-16": last tick each
+    # job is whichever of its own minute offsets falls before 17:00 — e.g.
+    # Job 2's last tick is 16:45, Job 3's is 16:47). Deliberately narrower
+    # than 24/7: accepts losing the first ~1-2h of each market's life
+    # (markets typically publish ~23:00 SGT the evening before) in exchange
+    # for not running discovery/scanning/execution/settlement overnight.
+    # Job 5 (below) is intentionally NOT restricted — position risk
+    # management must never have a window, only position-opening does.
+    HOURS = "1-16"
+
+    # Job 1 — Market discovery: every 20 min, self-healing.
     # Old design fired once at 07:30 SGT with no retry; a single Gamma
     # hiccup at that exact minute left the bot with zero tokens for a full
     # day (confirmed root cause of the Jul 2-3 zero-trade incident).
@@ -539,57 +557,62 @@ def main():
         job_market_discovery,
         trigger   = "cron",
         minute    = "0,20,40",
+        hour      = HOURS,
         timezone  = _SGT,
         id        = "market_discovery",
         name      = "Market Discovery",
         max_instances = 1,
     )
 
-    # Job 2 — Signal scan: every 15 min, 24/7.
+    # Job 2 — Signal scan: every 15 min.
     # Market quality gates (liquidity floor, spread cap in core/edge.py)
-    # already suppress bad signals on thin overnight books — a clock
-    # window isn't needed for that, and was excluding legitimate trading
-    # hours (markets launch the evening before and trade continuously).
+    # already suppress bad signals on thin overnight books.
     scheduler.add_job(
         job_signal_scan,
         trigger   = "cron",
         minute    = "0,15,30,45",
+        hour      = HOURS,
         timezone  = _SGT,
         id        = "signal_scan",
         name      = "Signal Scan",
         max_instances = 1,
     )
 
-    # Job 3 — Execution: every 15 min, 24/7, offset +2 min from Job 2
+    # Job 3 — Execution: every 15 min, offset +2 min from Job 2
     # so _state["signals"] is always freshly computed before Job 3 reads it.
     scheduler.add_job(
         job_order_execution,
         trigger   = "cron",
         minute    = "2,17,32,47",
+        hour      = HOURS,
         timezone  = _SGT,
         id        = "order_execution",
         name      = "Order Execution",
         max_instances = 1,
     )
 
-    # Job 4 — Settlement: every 15 min, 24/7. Checks both today's and
-    # yesterday's market_date every cycle (see job_settlement_check).
+    # Job 4 — Settlement: every 15 min. Checks both today's and
+    # yesterday's market_date every cycle (see job_settlement_check), so a
+    # market that resolves outside this window still gets picked up (with
+    # up to ~8h lag) on the next in-window tick rather than being missed.
     scheduler.add_job(
         job_settlement_check,
         trigger   = "cron",
         minute    = "5,20,35,50",
+        hour      = HOURS,
         timezone  = _SGT,
         id        = "settlement_check",
         name      = "Settlement Check",
         max_instances = 1,
     )
 
-    # Job 5 — Position monitor: every 5 min, 24/7.
-    # Previously windowed to hour="8-15" SGT, which never overlapped
-    # position_monitor.py's own HARD_EXIT_HOUR_SGT=16 check — the 16:00
-    # hard time-exit could never fire. Running 24/7 fixes that AND gives
-    # continuous trailing-stop/stop-loss protection to positions opened
-    # at any hour under Jobs 2/3's new round-the-clock schedule.
+    # Job 5 — Position monitor: every 5 min, 24/7 — deliberately NOT
+    # restricted to Jobs 1-4's window. Previously windowed to hour="8-15"
+    # SGT, which never overlapped position_monitor.py's own
+    # HARD_EXIT_HOUR_SGT=16 check — the 16:00 hard time-exit could never
+    # fire. Running 24/7 fixes that AND gives continuous trailing-stop/
+    # stop-loss protection (plus the stuck-position alert, moved here from
+    # Job 3) to any position regardless of when Jobs 1-4 last opened it.
     scheduler.add_job(
         job_position_monitor,
         trigger   = "cron",
