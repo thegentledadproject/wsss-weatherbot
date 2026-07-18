@@ -184,8 +184,8 @@
   <!-- KPI Row -->
   <div class="kpi-row">
     <div class="kpi-card">
-      <div class="kpi-label">Vault Balance</div>
-      <div class="kpi-value amber" id="kpi-vault">—</div>
+      <div class="kpi-label">Capital</div>
+      <div class="kpi-value amber" id="kpi-capital">—</div>
       <div class="kpi-sub" id="kpi-pnl">—</div>
     </div>
     <div class="kpi-card">
@@ -228,7 +228,7 @@
   <!-- Row 1: Equity + Exit reasons -->
   <div class="grid-2-1">
     <div class="panel">
-      <div class="panel-title">Vault equity curve</div>
+      <div class="panel-title">Equity curve</div>
       <canvas id="chart-equity"></canvas>
     </div>
     <div class="panel">
@@ -361,14 +361,14 @@ async function api(path) {
 function renderKPIs(d) {
   const pnl = d.net_pnl;
   const roi = d.roi_pct;
-  document.getElementById("kpi-vault").textContent = "$" + d.vault_current.toFixed(2);
+  document.getElementById("kpi-capital").textContent = "$" + d.capital_current.toFixed(2);
   const pnlEl = document.getElementById("kpi-pnl");
   pnlEl.textContent = (pnl >= 0 ? "+" : "") + "$" + pnl.toFixed(4) + " net P&L";
   pnlEl.className = "kpi-sub " + (pnl >= 0 ? "positive" : "negative");
   const roiEl = document.getElementById("kpi-roi");
   roiEl.textContent = (roi >= 0 ? "+" : "") + roi.toFixed(1) + "%";
   roiEl.className = "kpi-value " + (roi >= 0 ? "positive" : "negative");
-  document.getElementById("kpi-roi-sub").textContent = "from $" + d.vault_start.toFixed(0) + " start";
+  document.getElementById("kpi-roi-sub").textContent = "from $" + d.starting_capital.toFixed(0) + " start";
   const wrEl = document.getElementById("kpi-winrate");
   wrEl.textContent = d.win_rate_pct.toFixed(1) + "%";
   wrEl.className = "kpi-value " + (d.win_rate_pct >= 50 ? "positive" : "amber");
@@ -386,12 +386,12 @@ function renderKPIs(d) {
 function renderEquity(d) {
   if (!d.trades.length) return;
   const labels = d.trades.map((t, i) => "#" + (i + 1));
-  const vaults  = d.trades.map(t => t.vault);
+  const equities = d.trades.map(t => t.equity);
   const colors  = d.trades.map(t => t.realised_pnl >= 0 ? GREEN : RED);
   mkChart("chart-equity", "line", {
     labels,
     datasets: [{
-      label: "Vault", data: vaults,
+      label: "Equity", data: equities,
       borderColor: AMBER, borderWidth: 2.5,
       pointBackgroundColor: colors, pointRadius: 5,
       pointHoverRadius: 7, fill: false, tension: 0.2,
@@ -408,7 +408,7 @@ function renderEquity(d) {
     plugins: {
       legend: { display: false },
       annotation: { annotations: [{
-        type: "line", yMin: d.vault_start, yMax: d.vault_start,
+        type: "line", yMin: d.starting_capital, yMax: d.starting_capital,
         borderColor: MUTED, borderWidth: 1, borderDash: [6, 3],
       }]},
     },

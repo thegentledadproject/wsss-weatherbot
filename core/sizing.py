@@ -235,19 +235,22 @@ def compute_validation_size(
     direction: str = "BUY",
 ) -> SizingResult:
     """
-    Forced $1 sizing for end-to-end mechanics validation.
+    Forced fixed-$ sizing (VALIDATION_POSITION_USD, default $1.00).
 
-    Bypasses Kelly fraction, the $10 floor, and both EV hurdles entirely.
-    Trades on ANY actionable edge signal regardless of net EV after fees.
-    Real gross_ev and net_ev are still computed and attached to the result
-    for logging/research — only the gating is skipped.
+    Originally built for end-to-end mechanics validation before deploying
+    real capital; scheduler.py now calls this unconditionally as the
+    permanent sizing path (Kelly/vault sizing via compute_size() is disabled
+    but left intact above for future re-enable).
+
+    Bypasses Kelly fraction, the vault-relative cap/floor, and both EV
+    hurdles entirely. Trades on ANY actionable edge signal regardless of net
+    EV after fees. Real gross_ev and net_ev are still computed and attached
+    to the result for logging/research — only the gating is skipped.
 
     At $1 size, gas ($0.05) alone is 5% drag and taker fee adds another 2%,
     so net_ev will frequently print negative even on genuine edge signals.
-    This is expected and accepted — VALIDATION_MODE exists to prove the
-    full lifecycle (entry → trailing stop → stop loss → settlement) works
-    mechanically, not to be profitable. Never run with real capital deployed
-    at scale; use only to confirm fills, exits, and DB writes are correct.
+    This is expected and accepted — the point is fixed, predictable exposure
+    per trade, not fee-optimal sizing.
 
     Returns SizingResult with verdict="EXECUTE" unconditionally (caller in
     scheduler.py only invokes this for already-actionable EdgeSignals, so
