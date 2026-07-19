@@ -226,7 +226,16 @@ def compute_size(
 # ══════════════════════════════════════════════════════════════════════════════
 # VALIDATION MODE — forced $1 sizing, no Kelly/EV gating
 # ══════════════════════════════════════════════════════════════════════════════
-VALIDATION_POSITION_USD = float(os.getenv("VALIDATION_POSITION_USD", "1.00"))
+VALIDATION_POSITION_USD  = float(os.getenv("VALIDATION_POSITION_USD", "1.00"))
+
+# A flat $ notional implies more shares the cheaper the entry price (e.g. $1
+# at 0.05 = 20 shares vs $1 at 0.50 = 2 shares). More shares means a bigger
+# order to walk out of the book on exit, and that's exactly where thin,
+# deep-OTM books produce outsized slippage past the intended stop-loss level
+# (confirmed in production: a 30°C:YES position stopped out at -40% against
+# a 10% target). Capping shares — not just $ — bounds that exposure directly,
+# regardless of how liquidity has moved since entry.
+MAX_SHARES_PER_POSITION = float(os.getenv("MAX_SHARES_PER_POSITION", "10"))
 
 
 def compute_validation_size(
@@ -235,7 +244,8 @@ def compute_validation_size(
     direction: str = "BUY",
 ) -> SizingResult:
     """
-    Forced fixed-$ sizing (VALIDATION_POSITION_USD, default $1.00).
+    Forced fixed-$ sizing (VALIDATION_POSITION_USD, default $1.00), capped by
+    share count for cheap entries (MAX_SHARES_PER_POSITION, default 15).
 
     Originally built for end-to-end mechanics validation before deploying
     real capital; scheduler.py now calls this unconditionally as the
@@ -263,16 +273,27 @@ def compute_validation_size(
             "ask_price_out_of_range (validation mode still respects this)",
         )
 
+    size_usd = VALIDATION_POSITION_USD
+    implied_shares = size_usd / market_ask
+    if implied_shares > MAX_SHARES_PER_POSITION:
+        size_usd = round(MAX_SHARES_PER_POSITION * market_ask, 4)
+        logger.info(
+            f"[SIZING] VALIDATION_MODE: cheap entry (price={market_ask:.4f}) would "
+            f"need {implied_shares:.1f} shares at ${VALIDATION_POSITION_USD:.2f} — "
+            f"capped to {MAX_SHARES_PER_POSITION:.0f} shares (${size_usd:.2f}) to "
+            f"limit exit-side slippage exposure"
+        )
+
     p = model_prob
     q = 1.0 - p
     b = (1.0 - market_ask) / market_ask
     gross_ev = (p * b) - q
 
-    gas_frac = GAS_COST_USD / VALIDATION_POSITION_USD
+    gas_frac = GAS_COST_USD / size_usd
     net_ev   = gross_ev - (TAKER_FEE_RATE + gas_frac)
 
     logger.info(
-        f"[SIZING] VALIDATION_MODE: forcing ${VALIDATION_POSITION_USD:.2f} "
+        f"[SIZING] VALIDATION_MODE: forcing ${size_usd:.2f} "
         f"(gross_ev={gross_ev*100:+.2f}% net_ev={net_ev*100:+.2f}% "
         f"— gating skipped, fee drag at this size is {gas_frac*100:.1f}% from gas alone)"
     )
@@ -280,7 +301,7 @@ def compute_validation_size(
     return SizingResult(
         "EXECUTE",
         direction,
-        VALIDATION_POSITION_USD,
+        size_usd,
         round(net_ev, 5),
         round(gross_ev, 5),
         0.0,   # kelly_raw not applicable in validation mode
