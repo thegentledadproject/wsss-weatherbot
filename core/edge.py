@@ -64,7 +64,12 @@ MAX_EDGE_MAGNITUDE = 0.50  # overridden by env in scheduler
 # stop-loss target, purely from thin-book slippage on the way out.
 LOW_PRICE_THRESHOLD       = float(os.getenv("LOW_PRICE_THRESHOLD", "0.15"))
 LOW_PRICE_LIQUIDITY_FLOOR = float(os.getenv("LOW_PRICE_LIQUIDITY_FLOOR", "25.0"))
-MIN_ENTRY_PRICE           = float(os.getenv("MIN_ENTRY_PRICE", "0.08"))
+# Set equal to LOW_PRICE_THRESHOLD by choice: this makes the raised-floor
+# check below dead code (MIN_ENTRY_PRICE already blocks everything it would
+# otherwise apply to) — kept rather than removed so reopening a graduated
+# band below MIN_ENTRY_PRICE later is a one-line change (raise
+# LOW_PRICE_THRESHOLD above MIN_ENTRY_PRICE), not a re-derivation.
+MIN_ENTRY_PRICE           = float(os.getenv("MIN_ENTRY_PRICE", "0.15"))
 
 
 class MarketPrice:
