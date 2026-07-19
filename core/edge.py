@@ -41,6 +41,7 @@ and traded, even though it would otherwise look like the best signal on the
 board.
 """
 
+import os
 import logging
 import requests
 from typing import Dict, Optional, Tuple
@@ -52,6 +53,18 @@ CLOB_BOOK_URL     = "https://clob.polymarket.com/book"
 
 EDGE_THRESHOLD     = 0.08  # overridden by env in scheduler; raised from 0.05 for win-rate selectivity
 MAX_EDGE_MAGNITUDE = 0.50  # overridden by env in scheduler
+
+# Cheap long-shot brackets (e.g. a 30c YES) need proportionally more shares
+# to fill the same $ notional, so the same top-of-book $ liquidity absorbs a
+# BUY/entry fine but leaves an exit walking much deeper into the book once
+# the position needs to close — and that book can (and does) thin out further
+# in the minutes/hours between entry and exit. Confirmed in production: a
+# 30°C:YES position entered at 0.05 passed the standard $10 liquidity floor,
+# then its STOP_LOSS exit filled at 0.03 — a 40% realized loss against a 10%
+# stop-loss target, purely from thin-book slippage on the way out.
+LOW_PRICE_THRESHOLD       = float(os.getenv("LOW_PRICE_THRESHOLD", "0.15"))
+LOW_PRICE_LIQUIDITY_FLOOR = float(os.getenv("LOW_PRICE_LIQUIDITY_FLOOR", "25.0"))
+MIN_ENTRY_PRICE           = float(os.getenv("MIN_ENTRY_PRICE", "0.08"))
 
 
 class MarketPrice:
@@ -87,6 +100,7 @@ ACTION_HOLD_EDGE = "HOLD_EDGE"        # priced + liquid, but |edge| < threshold
 ACTION_SKIP_LIQ  = "SKIP_ILLIQUID"   # top-of-book liquidity too low
 ACTION_SKIP_SPRD = "SKIP_SPREAD"     # bid/ask spread > 8c
 ACTION_SKIP_EXTREME = "SKIP_EXTREME_EDGE"  # |edge| > sanity cap — likely miscalibration, not opportunity
+ACTION_SKIP_LOW_PRICE = "SKIP_LOW_PRICE"  # token priced below MIN_ENTRY_PRICE — thin-book exit slippage risk
 ACTION_NO_PRICE  = "NO_PRICE"        # price fetch failed entirely
 
 
@@ -338,12 +352,34 @@ def compute_edge(
             no_token_id=no_token_id,
         )
 
+    # Minimum entry price gate — a cheap long-shot token needs proportionally
+    # more shares to fill the same $ notional, which is exactly the segment
+    # where entry-time liquidity checks are least predictive of exit-time
+    # slippage (see LOW_PRICE_THRESHOLD comment above). Checked before the
+    # liquidity gate since it's a blanket price-range decision, not a
+    # book-depth measurement.
+    if market_price.mid_price < MIN_ENTRY_PRICE:
+        logger.info(
+            f"[EDGE] {bracket_label}: price {market_price.mid_price:.4f} < "
+            f"min entry {MIN_ENTRY_PRICE} — gated (thin-book exit slippage risk)"
+        )
+        return EdgeSignal(
+            bracket_label=bracket_label, token_id=token_id,
+            model_prob=model_prob, market_price=market_price,
+            edge=edge, edge_threshold=edge_threshold,
+            gate_reason=ACTION_SKIP_LOW_PRICE,
+            no_token_id=no_token_id,
+        )
+
     # Liquidity gate — blocks two cases:
     #   1. Gamma-fallback prices (liquidity_usd == -1.0): depth unknown, so we
     #      have a signal for the dashboard but must not execute against a
     #      fabricated spread.
     #   2. Real books too thin to absorb a min-size order without moving price
     #      (0 <= liquidity_usd < floor).
+    # Cheap brackets (< LOW_PRICE_THRESHOLD) get a higher floor: the same $
+    # of top-of-book liquidity covers far fewer real dollars of slippage
+    # margin once you're already down near a few cents.
     if market_price.liquidity_usd < 0:
         logger.info(
             f"[EDGE] {bracket_label}: price via Gamma fallback (depth unknown) — "
@@ -356,10 +392,15 @@ def compute_edge(
             gate_reason=ACTION_SKIP_LIQ,
             no_token_id=no_token_id,
         )
-    if market_price.liquidity_usd < min_liquidity_usd:
+    effective_liq_floor = (
+        max(min_liquidity_usd, LOW_PRICE_LIQUIDITY_FLOOR)
+        if market_price.mid_price < LOW_PRICE_THRESHOLD
+        else min_liquidity_usd
+    )
+    if market_price.liquidity_usd < effective_liq_floor:
         logger.info(
             f"[EDGE] {bracket_label}: liquidity ${market_price.liquidity_usd:.2f} "
-            f"< floor ${min_liquidity_usd} — gated"
+            f"< floor ${effective_liq_floor:.2f} — gated"
         )
         return EdgeSignal(
             bracket_label=bracket_label, token_id=token_id,

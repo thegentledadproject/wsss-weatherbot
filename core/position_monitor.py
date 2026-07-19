@@ -207,11 +207,16 @@ def evaluate_exit(
     stop_level_price = entry_price * (1.0 - stop_loss_pct)
     stop_trigger = mid <= stop_level_price
 
+    # Logged every cycle (not just on exit) so a thinning book shows up in
+    # the trail leading up to an exit, not only in hindsight after slippage
+    # already happened — see MAX_SHARES_PER_POSITION / low-price liquidity
+    # floor in core/sizing.py and core/edge.py for the entry-side mitigation.
+    liq_str = f"${market_price.liquidity_usd:.2f}" if market_price.liquidity_usd >= 0 else "unknown"
     trail_str = f"{trail_level:.4f}" if trail_level is not None else "not_armed"
     logger.info(
         f"[MONITOR] {label} {direction} | mid={mid:.4f} peak={peak_price:.4f} "
         f"trail_lvl={trail_str} "
-        f"stop_lvl={stop_level_price:.4f}"
+        f"stop_lvl={stop_level_price:.4f} liq={liq_str}"
     )
 
     if trail_trigger:
@@ -470,10 +475,12 @@ class PositionMonitor:
         direction = decision.direction
         reason    = decision.reason
 
+        decision_liq = decision.market_price.liquidity_usd if decision.market_price else None
+        liq_str = f"${decision_liq:.2f}" if decision_liq is not None and decision_liq >= 0 else "unknown"
         logger.info(
             f"[MONITOR] → EXIT {label} [{direction}] {reason} "
             f"peak={decision.peak_price:.4f} mid={decision.current_mid:.4f} "
-            f"size=${size_usd:.2f}"
+            f"size=${size_usd:.2f} decision_liq={liq_str}"
         )
 
         # ── Exact share count to close — NOT size_usd (the original dollar
