@@ -124,6 +124,28 @@ def _rows(query: str, params: tuple = ()) -> List[Dict[str, Any]]:
         logger.error(f"[DASHBOARD] Query failed: {query[:80]}... — {e}")
         return []
 
+def _market_detail(bracket_label: str, market_date: str) -> str:
+    """
+    Build the full market question, e.g. "Will the highest temperature in
+    Singapore be 31°C on July 19?" — a bare bracket_label ("31°C") loses
+    the date entirely, making trade history/open positions ambiguous
+    without cross-referencing the DB directly (the exact ask that
+    prompted this: raw bracket labels alone don't show "full detail").
+
+    bracket_label may carry a ":YES"/":NO" suffix (open_positions) or be
+    plain (exit_log, which has direction as its own column) — strip it
+    either way since direction is always shown separately alongside this.
+    """
+    label = bracket_label.split(":")[0]
+    try:
+        dt = datetime.datetime.strptime(market_date, "%Y-%m-%d")
+        # str(dt.day) not strftime("%-d") — glibc-only, raises ValueError
+        # on non-glibc platforms (same portability note as core/discovery.py).
+        date_str = f"{dt.strftime('%B')} {dt.day}"
+    except (ValueError, TypeError):
+        date_str = market_date or "unknown date"
+    return f"Will the highest temperature in Singapore be {label} on {date_str}?"
+
 def _scalar(query: str, params: tuple = (), default: Any = 0.0) -> Any:
     if not os.path.exists(DB_PATH):
         return default
@@ -540,6 +562,7 @@ def open_positions():
         direction = "NO" if ":NO" in label else "YES"
         entry     = float(r["entry_price"])
         size_usd  = float(r["size_usd"])
+        r["market_detail"] = _market_detail(label, r.get("market_date", ""))
         peak_raw  = r.get("peak_price")
         peak      = float(peak_raw) if peak_raw is not None else entry
         shares_held = size_usd / entry
@@ -606,7 +629,7 @@ def trades(limit: int = 100):
     """
     rows = _rows(
         "SELECT id, closed_at, bracket_label, direction, reason, "
-        "entry_price, exit_price, size_usd, realised_pnl, opened_at "
+        "entry_price, exit_price, size_usd, realised_pnl, opened_at, market_date "
         "FROM exit_log ORDER BY id DESC LIMIT ?",
         (limit,),
     )
@@ -620,4 +643,5 @@ def trades(limit: int = 100):
                 r[field] = (utc_dt + datetime.timedelta(hours=8)).isoformat()
             except ValueError:
                 pass  # leave malformed/unexpected values untouched rather than crash the endpoint
+        r["market_detail"] = _market_detail(r["bracket_label"], r.get("market_date", ""))
     return {"trades": rows}
