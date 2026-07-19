@@ -86,8 +86,6 @@
                margin-bottom: 16px; }
   .grid-3-2  { display: grid; grid-template-columns: 3fr 2fr; gap: 16px;
                margin-bottom: 16px; }
-  .grid-2-1b { display: grid; grid-template-columns: 2fr 1fr; gap: 16px;
-               margin-bottom: 16px; }
 
   .panel     { background: var(--surf); border: 1px solid var(--border);
                border-radius: var(--radius); padding: 18px 20px; }
@@ -95,19 +93,6 @@
                  color: var(--muted); margin-bottom: 14px; }
 
   canvas     { max-height: 260px; }
-
-  /* ── Open positions ── */
-  .pos-card  { background: var(--bg); border: 1px solid var(--border);
-               border-radius: 6px; padding: 12px 14px; margin-bottom: 10px; }
-  .pos-top   { display: flex; justify-content: space-between; align-items: baseline;
-               flex-wrap: wrap; gap: 4px 12px; }
-  .pos-label { font-weight: 700; font-size: 14px; color: var(--amber); flex: 1 1 auto;
-               min-width: 200px; }
-  .pos-size  { font-family: var(--font-mono); font-size: 13px; flex: 0 0 auto; }
-  .pos-row   { font-size: 11px; color: var(--muted); margin-top: 4px; }
-  .pos-trail { color: var(--teal); }
-  .pos-stop  { color: var(--red); }
-  .pos-empty { color: var(--muted); font-size: 12px; padding: 16px 0; }
 
   /* ── Trade table ── */
   .table-wrap { overflow-x: auto; }
@@ -141,7 +126,7 @@
 
   @media (max-width: 900px) {
     .kpi-row { grid-template-columns: repeat(3,1fr); }
-    .grid-2-1,.grid-3-2,.grid-2-1b { grid-template-columns: 1fr; }
+    .grid-2-1,.grid-3-2 { grid-template-columns: 1fr; }
   }
   @media (max-width: 560px) {
     .kpi-row { grid-template-columns: repeat(2,1fr); }
@@ -284,30 +269,24 @@
     </div>
   </div>
 
-  <!-- Row 3: Calibration + Open positions -->
-  <div class="grid-2-1b">
-    <div class="panel">
-      <div class="panel-title">GFS/ECMWF calibration — residuals (actual − model μ)</div>
-      <canvas id="chart-calib"></canvas>
-    </div>
-    <div class="panel">
-      <div class="panel-title">Open positions</div>
-      <div id="positions-container"><div class="pos-empty">No open positions.</div></div>
-    </div>
+  <!-- Row 3: Calibration -->
+  <div class="panel" style="margin-bottom:16px">
+    <div class="panel-title">GFS/ECMWF calibration — residuals (actual − model μ)</div>
+    <canvas id="chart-calib"></canvas>
   </div>
 
-  <!-- Trade history -->
+  <!-- Trade history (open positions included, most recent first) -->
   <hr class="divider">
   <div class="section-title">Trade history</div>
   <div class="table-wrap">
     <table>
       <thead>
         <tr>
-          <th>Opened (SGT)</th><th>Closed (SGT)</th><th>Market</th><th>Dir</th><th>Exit Reason</th>
+          <th>Opened (SGT)</th><th>Closed (SGT)</th><th>Market</th><th>Dir</th><th>Status</th><th>Exit Reason</th>
           <th>Entry</th><th>Exit</th><th>Size</th><th>P&amp;L</th>
         </tr>
       </thead>
-      <tbody id="trades-tbody"><tr><td colspan="9" style="color:var(--muted);text-align:center;padding:20px">No trades yet.</td></tr></tbody>
+      <tbody id="trades-tbody"><tr><td colspan="10" style="color:var(--muted);text-align:center;padding:20px">No trades yet.</td></tr></tbody>
     </table>
   </div>
 
@@ -588,69 +567,70 @@ function renderCalib(d) {
   });
 }
 
-function renderPositions(d) {
-  const el = document.getElementById("positions-container");
-  if (!d.positions.length) {
-    el.innerHTML = '<div class="pos-empty">No open positions.</div>';
-    return;
-  }
-  el.innerHTML = d.positions.map(p => {
-    const label     = p.bracket_label;
-    const bracket   = label.split(":")[0];
-    const detail    = p.market_detail || bracket;
-    const dir       = p.direction;
-    const entry     = +p.entry_price;
-    const peak      = +(p.peak_price || entry);
-    const size      = +p.size_usd;
-    const armed     = p.trail_armed;
-    const trail     = p.trail_level;
-    const stop      = p.stop_level;
-    const hours     = p.hold_hours;
-    const value     = p.current_value != null ? +p.current_value : size;
-    const pnlPct    = p.unrealized_pnl_pct;
-    const pnlUsd    = p.unrealized_pnl_usd != null ? +p.unrealized_pnl_usd : 0;
-    const pnlCls    = pnlUsd >= 0 ? "positive" : "negative";
-    const profitPct = p.profit_taking_pct;
-    const stopPct   = p.stop_loss_pct;
-    const trailStr = armed && trail
-      ? `Trail: ${trail.toFixed(4)}` : "Trail: arming…";
-    return `
-<div class="pos-card">
-  <div class="pos-top">
-    <span class="pos-label">${detail} (${dir})</span>
-    <span class="pos-size">$${value.toFixed(2)}</span>
-  </div>
-  <div class="pos-row">Entry ${entry.toFixed(4)} · Peak ${peak.toFixed(4)} · ${hours}h open</div>
-  <div class="pos-row ${pnlCls}">Value $${value.toFixed(2)} (${pnlUsd >= 0 ? "+" : ""}$${pnlUsd.toFixed(4)}${pnlPct != null ? `, ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}%` : ""})</div>
-  <div class="pos-row pos-trail">${trailStr}${profitPct != null ? ` (take-profit ${profitPct.toFixed(0)}%)` : ""}</div>
-  <div class="pos-row pos-stop">Stop: ${stop ? stop.toFixed(4) : "—"}${stopPct != null ? ` (-${stopPct.toFixed(1)}%)` : ""}</div>
-</div>`;
-  }).join("");
-}
-
-function renderTrades(d) {
+function renderTrades(trades, opens) {
   const tbody = document.getElementById("trades-tbody");
-  if (!d.trades.length) {
-    tbody.innerHTML = '<tr><td colspan="9" style="color:var(--muted);text-align:center;padding:20px">No trades yet.</td></tr>';
-    return;
-  }
   const REASON_CLS = { TRAILING_STOP: "badge-trail", STOP_LOSS: "badge-stop", TIME_EXIT: "badge-time" };
   const DIR_CLS    = { BUY: "badge-buy", SELL: "badge-sell" };
-  tbody.innerHTML = d.trades.map(t => {
-    const pnl   = +t.realised_pnl;
-    const pnlCl = pnl >= 0 ? "positive" : "negative";
-    const opened = (t.opened_at || "").slice(0, 16);
-    const closed = (t.closed_at || "").slice(0, 16);
-    const exit   = t.exit_price != null ? (+t.exit_price).toFixed(4) : "—";
+
+  // Open positions use YES/NO (outcome side) while closed trades use
+  // BUY/SELL (entry action) for the same concept — normalize to BUY/SELL
+  // so both row kinds share the same badge styling.
+  const openRows = (opens.positions || []).map(p => ({
+    opened_at:    p.opened_at,
+    closed_at:    null,
+    market_detail: p.market_detail,
+    bracket_label: p.bracket_label,
+    direction:    p.direction === "NO" ? "SELL" : "BUY",
+    reason:       null,
+    entry_price:  p.entry_price,
+    exit_price:   p.current_price,
+    size_usd:     p.size_usd,
+    pnl:          p.unrealized_pnl_usd,
+    isOpen:       true,
+  }));
+  const closedRows = (trades.trades || []).map(t => ({
+    opened_at:    t.opened_at,
+    closed_at:    t.closed_at,
+    market_detail: t.market_detail,
+    bracket_label: t.bracket_label,
+    direction:    t.direction,
+    reason:       t.reason,
+    entry_price:  t.entry_price,
+    exit_price:   t.exit_price,
+    size_usd:     t.size_usd,
+    pnl:          t.realised_pnl,
+    isOpen:       false,
+  }));
+
+  const rows = [...openRows, ...closedRows].sort((a, b) => (a.opened_at < b.opened_at ? 1 : -1));
+
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="10" style="color:var(--muted);text-align:center;padding:20px">No trades yet.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = rows.map(r => {
+    const pnl    = r.pnl != null ? +r.pnl : 0;
+    const pnlCl  = pnl >= 0 ? "positive" : "negative";
+    const opened = (r.opened_at || "").slice(0, 16);
+    const closed = (r.closed_at || "").slice(0, 16) || "—";
+    const exit   = r.exit_price != null ? (+r.exit_price).toFixed(4) : "—";
+    const statusBadge = r.isOpen
+      ? '<span class="badge badge-pass">OPEN</span>'
+      : '<span class="badge badge-hold">CLOSED</span>';
+    const reasonCell = r.reason
+      ? `<span class="badge ${REASON_CLS[r.reason] || ''}">${r.reason}</span>`
+      : "—";
     return `<tr>
       <td>${opened}</td>
       <td>${closed}</td>
-      <td>${t.market_detail || t.bracket_label}</td>
-      <td><span class="badge ${DIR_CLS[t.direction] || ''}">${t.direction}</span></td>
-      <td><span class="badge ${REASON_CLS[t.reason] || ''}">${t.reason}</span></td>
-      <td>${(+t.entry_price).toFixed(4)}</td>
+      <td>${r.market_detail || r.bracket_label}</td>
+      <td><span class="badge ${DIR_CLS[r.direction] || ''}">${r.direction}</span></td>
+      <td>${statusBadge}</td>
+      <td>${reasonCell}</td>
+      <td>${(+r.entry_price).toFixed(4)}</td>
       <td>${exit}</td>
-      <td>$${(+t.size_usd).toFixed(2)}</td>
+      <td>$${(+r.size_usd).toFixed(2)}</td>
       <td class="${pnlCl}">${pnl >= 0 ? "+" : ""}$${pnl.toFixed(4)}</td>
     </tr>`;
   }).join("");
@@ -913,8 +893,7 @@ async function refresh() {
     renderLatestScan(scan);
     renderPnlByBracket(pnl);
     renderCalib(calib);
-    renderPositions(opens);
-    renderTrades(trades);
+    renderTrades(trades, opens);
 
   } catch (err) {
     // Data refresh failed but the status poller owns the status bar —
