@@ -533,8 +533,8 @@ def open_positions():
     from core.edge import fetch_market_price
 
     rows = _rows("SELECT * FROM open_positions ORDER BY opened_at ASC")
-    trail_pct   = float(os.getenv("TRAIL_PCT", 0.20))
-    edge_thresh = float(os.getenv("EDGE_THRESHOLD", 0.05))
+    trail_pct     = float(os.getenv("TRAIL_PCT", 0.20))
+    stop_loss_pct = float(os.getenv("STOP_LOSS_PCT", 0.10))
     for r in rows:
         label     = r["bracket_label"]
         direction = "NO" if ":NO" in label else "YES"
@@ -553,13 +553,15 @@ def open_positions():
         # synthetic short on YES, so there's no inverted case anymore.
         r["trail_level"]  = round(peak * (1 - trail_pct), 5) if peak > entry else None
         r["trail_armed"]  = peak > entry
-        r["stop_level"]   = round(entry - edge_thresh, 5)
-        # Config thresholds as percentages — the trailing-stop drawdown is
-        # already scale-free (20% off peak regardless of price level), but
-        # the stop-loss is a fixed price delta (EDGE_THRESHOLD), so express
-        # it relative to entry so it reads the same way ("triggers at -X%").
+        # Percentage-of-entry, matching core/position_monitor.py's
+        # evaluate_exit() — previously a fixed $ delta (EDGE_THRESHOLD)
+        # subtracted from entry regardless of entry level, which gave a
+        # cheap long-shot entry a far larger real drawdown tolerance than an
+        # expensive one for the same nominal distance. See position_monitor's
+        # module docstring for the production incident this fixed.
+        r["stop_level"]   = round(entry * (1 - stop_loss_pct), 5)
         r["profit_taking_pct"] = round(trail_pct * 100, 2)
-        r["stop_loss_pct"]     = round((edge_thresh / entry) * 100, 2) if entry > 0 else None
+        r["stop_loss_pct"]     = round(stop_loss_pct * 100, 2)
 
         # Current market value + unrealised P&L — a fresh price fetch per
         # position (same call position_monitor.py makes each cycle); a

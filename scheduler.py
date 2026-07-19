@@ -48,10 +48,10 @@ discovery trigger) had three consequences, all now fixed:
      times or how many dates are checked per cycle.
 
 Jobs (all times SGT):
-  Job 1 — market_discovery   : every 20 min, 01:00-17:00 — self-healing token matrix
-  Job 2 — signal_scan        : every 15 min, 01:00-17:00 — forecast + edge scan
-  Job 3 — order_execution    : every 15 min, 01:00-17:00 (offset +2 min from Job 2)
-  Job 4 — settlement_check   : every 15 min, 01:00-17:00 — checks today AND yesterday
+  Job 1 — market_discovery   : every 20 min, 23:00-17:00 — self-healing token matrix
+  Job 2 — signal_scan        : every 15 min, 23:00-17:00 — forecast + edge scan
+  Job 3 — order_execution    : every 15 min, 23:00-17:00 (offset +2 min from Job 2)
+  Job 4 — settlement_check   : every 15 min, 23:00-17:00 — checks today AND yesterday
   Job 5 — position_monitor   : every 5 min, 24/7 — trailing stop/stop loss/time exit/
                                 stuck-position alert (deliberately NOT windowed — risk
                                 management must never stop just because Jobs 1-4 did)
@@ -121,9 +121,15 @@ from core.position_monitor import PositionMonitor
 
 # ── Config from environment ────────────────────────────────────────────────────
 DB_PATH       = os.getenv("DB_PATH",              "hermes.db")
-EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", 0.05))
+EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", 0.08))  # raised from 0.05 for win-rate selectivity
 MAX_EDGE_MAGNITUDE = float(os.getenv("MAX_EDGE_MAGNITUDE", 0.50))
 TRAIL_PCT      = float(os.getenv("TRAIL_PCT", 0.20))
+# Percentage-of-entry stop loss (core/position_monitor.py) — decoupled from
+# EDGE_THRESHOLD, which previously did double duty as a fixed-$ stop
+# distance. See position_monitor.py's module docstring for the incident
+# this fixes (a 0.089 entry got a 56% drawdown tolerance before its stop
+# fired, vs ~5-10% for a normally-priced entry, from the same $0.05 delta).
+STOP_LOSS_PCT  = float(os.getenv("STOP_LOSS_PCT", 0.10))
 ICAO          = "WSSS"
 
 # ── Shared state ───────────────────────────────────────────────────────────────
@@ -471,7 +477,7 @@ def job_position_monitor():
     monitor = PositionMonitor(
         client         = _client,
         ledger         = _ledger,
-        edge_threshold = EDGE_THRESHOLD,
+        stop_loss_pct  = STOP_LOSS_PCT,
         trail_pct      = TRAIL_PCT,
         icao           = ICAO,
     )
@@ -560,15 +566,17 @@ def main():
     # Explicit timezone for all jobs — avoids UTC fallback on VPS without pytz
     _SGT = "Asia/Singapore"
 
-    # Jobs 1-4 — restricted to 01:00-17:00 SGT (hour="1-16": last tick each
-    # job is whichever of its own minute offsets falls before 17:00 — e.g.
-    # Job 2's last tick is 16:45, Job 3's is 16:47). Deliberately narrower
-    # than 24/7: accepts losing the first ~1-2h of each market's life
-    # (markets typically publish ~23:00 SGT the evening before) in exchange
-    # for not running discovery/scanning/execution/settlement overnight.
+    # Jobs 1-4 — restricted to 23:00-17:00 SGT (hour="23,0-16": wraps
+    # midnight — 23 plus the 0-16 range; last tick each job is whichever of
+    # its own minute offsets falls before 17:00 — e.g. Job 2's last tick is
+    # 16:45, Job 3's is 16:47). Widened from 01:00-17:00 to start at 23:00
+    # so Jobs 1-3 catch each market at (or near) the moment Polymarket
+    # actually publishes it (~23:00 SGT the evening before), instead of
+    # missing its first ~2 hours. Accepted cost: discovery/scan/execution/
+    # settlement now also run through 23:00-01:00 instead of being dormant.
     # Job 5 (below) is intentionally NOT restricted — position risk
     # management must never have a window, only position-opening does.
-    HOURS = "1-16"
+    HOURS = "23,0-16"
 
     # Job 1 — Market discovery: every 20 min, self-healing.
     # Old design fired once at 07:30 SGT with no retry; a single Gamma

@@ -29,7 +29,16 @@ EXIT CONDITIONS (priority order):
       16:00 time exit, capturing the full move.
 
   EXIT 2 — STOP LOSS
-    mid <= entry_price - EDGE_THRESHOLD  (market moved against entry)
+    mid <= entry_price * (1 - STOP_LOSS_PCT)  (market moved against entry)
+    Percentage-of-entry, NOT a fixed absolute price delta. Previously this
+    subtracted a flat EDGE_THRESHOLD (0.05) from entry_price regardless of
+    entry level — fine for a ~0.50-0.90 entry (5-10% real tolerance), but a
+    cheap long-shot entry like 0.089 got a stop at 0.039, a 56% drawdown
+    tolerance before firing. Same nominal $0.05 distance, wildly different
+    real risk exposure depending on price. Confirmed in production: a
+    30°C:YES position entered at 0.08929 sat at -49.6% unrealized, still
+    nowhere near triggering. Percentage-of-entry gives consistent relative
+    protection regardless of entry price.
 
   EXIT 3 — TIME EXIT (unchanged)
     16:00 SGT hard close, all positions, best available price.
@@ -37,6 +46,10 @@ EXIT CONDITIONS (priority order):
 TRAIL_PCT is configurable via env var TRAIL_PCT (default 0.20).
 Set lower (e.g. 0.10) for tighter stops on thin books.
 Set higher (e.g. 0.30) to tolerate more intraday noise.
+
+STOP_LOSS_PCT is configurable via env var STOP_LOSS_PCT (default 0.10).
+Decoupled from EDGE_THRESHOLD (core/edge.py's separate edge-detection gate) —
+these are two different concerns that used to share one config value.
 
 peak_price is persisted in the DB open_positions table (added in v4.5).
 Updated every Job 5 cycle when a new high/low is observed.
@@ -59,8 +72,8 @@ from core.execution import _is_ghost_book, VWAP_DRIFT_TOLERANCE
 logger = logging.getLogger("hermes.monitor")
 
 HARD_EXIT_HOUR_SGT = 16
-EDGE_THRESHOLD     = 0.05   # injected by scheduler from env
 TRAIL_PCT          = float(os.getenv("TRAIL_PCT", 0.20))
+STOP_LOSS_PCT      = float(os.getenv("STOP_LOSS_PCT", 0.10))  # % of entry, not a fixed $ delta
 
 
 class ExitReason:
@@ -121,7 +134,7 @@ def evaluate_exit(
     entry_price:     float,
     peak_price:      float,
     model_prob:      float,
-    edge_threshold:  float,
+    stop_loss_pct:   float,
     trail_pct:       float,
     ledger:          Ledger,
     force_time_exit: bool = False,
@@ -130,9 +143,12 @@ def evaluate_exit(
     Evaluate whether to exit a position using trailing stop logic.
 
     Args:
-        peak_price: best price seen since entry (max mid for BUY, min mid for SELL).
-                    Loaded from DB, updated here if new peak observed.
-        trail_pct:  fractional drawdown from peak that triggers exit.
+        peak_price:    best price seen since entry (max mid for BUY, min mid for SELL).
+                       Loaded from DB, updated here if new peak observed.
+        trail_pct:     fractional drawdown from peak that triggers exit.
+        stop_loss_pct: fractional drawdown from ENTRY (not peak) that triggers
+                       exit — e.g. 0.10 = stop fires at 90% of entry price,
+                       regardless of what that entry price actually is.
     """
     direction = _parse_direction(position_label)
     label     = _parse_bracket(position_label)
@@ -180,14 +196,17 @@ def evaluate_exit(
 
     # ── Stop loss ─────────────────────────────────────────────────────────
     # Independent of trailing stop — fires if market moves against entry
-    # before the trailing stop is armed.
-    stop_trigger = mid <= (entry_price - edge_threshold)
+    # before the trailing stop is armed. Percentage-of-entry (not a fixed
+    # absolute delta) so a cheap long-shot entry gets the same relative
+    # protection as an expensive one — see module docstring.
+    stop_level_price = entry_price * (1.0 - stop_loss_pct)
+    stop_trigger = mid <= stop_level_price
 
     trail_str = f"{trail_level:.4f}" if trail_level is not None else "not_armed"
     logger.info(
         f"[MONITOR] {label} {direction} | mid={mid:.4f} peak={peak_price:.4f} "
         f"trail_lvl={trail_str} "
-        f"stop_lvl={entry_price-edge_threshold:.4f}"
+        f"stop_lvl={stop_level_price:.4f}"
     )
 
     if trail_trigger:
@@ -293,15 +312,15 @@ class PositionMonitor:
         self,
         client:         ClobClient,
         ledger:         Ledger,
-        edge_threshold: float = EDGE_THRESHOLD,
+        stop_loss_pct:  float = STOP_LOSS_PCT,
         trail_pct:      float = TRAIL_PCT,
         icao:           str   = "WSSS",
     ):
-        self.client         = client
-        self.ledger         = ledger
-        self.edge_threshold = edge_threshold
-        self.trail_pct      = trail_pct
-        self.icao           = icao
+        self.client        = client
+        self.ledger        = ledger
+        self.stop_loss_pct = stop_loss_pct
+        self.trail_pct     = trail_pct
+        self.icao          = icao
 
     def run(self, model_probs: Dict[str, float], market_date: str = "") -> List[Dict]:
         """
@@ -390,7 +409,7 @@ class PositionMonitor:
                     entry_price     = entry_price,
                     peak_price      = peak_price,
                     model_prob      = model_prob,
-                    edge_threshold  = self.edge_threshold,
+                    stop_loss_pct   = self.stop_loss_pct,
                     trail_pct       = self.trail_pct,
                     ledger          = self.ledger,
                     force_time_exit = force_time_exit,

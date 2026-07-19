@@ -26,7 +26,9 @@ For NO trades (direction="SELL"):
   for the actual order.
   NO position pays $1 if outcome does NOT occur.
 
-Edge threshold: 5% (0.05) — set in .env as EDGE_THRESHOLD
+Edge threshold: 8% (0.08) — set in .env as EDGE_THRESHOLD (raised from 5%
+for win-rate selectivity). Stop-loss distance is a separate config
+(STOP_LOSS_PCT, core/position_monitor.py) — no longer coupled to this.
 
 Max edge magnitude: 50% (0.50) — set in .env as MAX_EDGE_MAGNITUDE. An edge
 this large means the model claims near-certainty against a market pricing
@@ -48,7 +50,7 @@ logger = logging.getLogger("hermes.edge")
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 CLOB_BOOK_URL     = "https://clob.polymarket.com/book"
 
-EDGE_THRESHOLD     = 0.05  # overridden by env in scheduler
+EDGE_THRESHOLD     = 0.08  # overridden by env in scheduler; raised from 0.05 for win-rate selectivity
 MAX_EDGE_MAGNITUDE = 0.50  # overridden by env in scheduler
 
 
