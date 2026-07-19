@@ -62,14 +62,13 @@ MAX_EDGE_MAGNITUDE = 0.50  # overridden by env in scheduler
 # 30°C:YES position entered at 0.05 passed the standard $10 liquidity floor,
 # then its STOP_LOSS exit filled at 0.03 — a 40% realized loss against a 10%
 # stop-loss target, purely from thin-book slippage on the way out.
-LOW_PRICE_THRESHOLD       = float(os.getenv("LOW_PRICE_THRESHOLD", "0.15"))
-LOW_PRICE_LIQUIDITY_FLOOR = float(os.getenv("LOW_PRICE_LIQUIDITY_FLOOR", "25.0"))
-# Set equal to LOW_PRICE_THRESHOLD by choice: this makes the raised-floor
-# check below dead code (MIN_ENTRY_PRICE already blocks everything it would
-# otherwise apply to) — kept rather than removed so reopening a graduated
-# band below MIN_ENTRY_PRICE later is a one-line change (raise
-# LOW_PRICE_THRESHOLD above MIN_ENTRY_PRICE), not a re-derivation.
-MIN_ENTRY_PRICE           = float(os.getenv("MIN_ENTRY_PRICE", "0.15"))
+MIN_ENTRY_PRICE           = float(os.getenv("MIN_ENTRY_PRICE", "0.20"))
+# LOW_PRICE_THRESHOLD (0.25) sits ABOVE MIN_ENTRY_PRICE (0.20), so the band
+# between them is live: a token priced 0.20-0.25 clears the hard floor but
+# still needs to clear LOW_PRICE_LIQUIDITY_FLOOR ($50, vs the standard $10)
+# to be tradeable — a graduated second check, not just a binary cutoff.
+LOW_PRICE_THRESHOLD       = float(os.getenv("LOW_PRICE_THRESHOLD", "0.25"))
+LOW_PRICE_LIQUIDITY_FLOOR = float(os.getenv("LOW_PRICE_LIQUIDITY_FLOOR", "50.0"))
 
 
 class MarketPrice:

@@ -235,7 +235,7 @@ VALIDATION_POSITION_USD  = float(os.getenv("VALIDATION_POSITION_USD", "1.00"))
 # (confirmed in production: a 30°C:YES position stopped out at -40% against
 # a 10% target). Capping shares — not just $ — bounds that exposure directly,
 # regardless of how liquidity has moved since entry.
-MAX_SHARES_PER_POSITION = float(os.getenv("MAX_SHARES_PER_POSITION", "15"))
+MAX_SHARES_PER_POSITION = float(os.getenv("MAX_SHARES_PER_POSITION", "10"))
 
 
 def compute_validation_size(
