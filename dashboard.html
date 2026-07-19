@@ -303,11 +303,11 @@
     <table>
       <thead>
         <tr>
-          <th>Closed (SGT)</th><th>Market</th><th>Dir</th><th>Exit Reason</th>
+          <th>Opened (SGT)</th><th>Closed (SGT)</th><th>Market</th><th>Dir</th><th>Exit Reason</th>
           <th>Entry</th><th>Exit</th><th>Size</th><th>P&amp;L</th>
         </tr>
       </thead>
-      <tbody id="trades-tbody"><tr><td colspan="8" style="color:var(--muted);text-align:center;padding:20px">No trades yet.</td></tr></tbody>
+      <tbody id="trades-tbody"><tr><td colspan="9" style="color:var(--muted);text-align:center;padding:20px">No trades yet.</td></tr></tbody>
     </table>
   </div>
 
@@ -631,7 +631,7 @@ function renderPositions(d) {
 function renderTrades(d) {
   const tbody = document.getElementById("trades-tbody");
   if (!d.trades.length) {
-    tbody.innerHTML = '<tr><td colspan="8" style="color:var(--muted);text-align:center;padding:20px">No trades yet.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" style="color:var(--muted);text-align:center;padding:20px">No trades yet.</td></tr>';
     return;
   }
   const REASON_CLS = { TRAILING_STOP: "badge-trail", STOP_LOSS: "badge-stop", TIME_EXIT: "badge-time" };
@@ -639,9 +639,11 @@ function renderTrades(d) {
   tbody.innerHTML = d.trades.map(t => {
     const pnl   = +t.realised_pnl;
     const pnlCl = pnl >= 0 ? "positive" : "negative";
+    const opened = (t.opened_at || "").slice(0, 16);
     const closed = (t.closed_at || "").slice(0, 16);
     const exit   = t.exit_price != null ? (+t.exit_price).toFixed(4) : "—";
     return `<tr>
+      <td>${opened}</td>
       <td>${closed}</td>
       <td>${t.market_detail || t.bracket_label}</td>
       <td><span class="badge ${DIR_CLS[t.direction] || ''}">${t.direction}</span></td>
