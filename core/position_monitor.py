@@ -143,31 +143,36 @@ def evaluate_exit(
     Evaluate whether to exit a position using trailing stop logic.
 
     Args:
-        peak_price:    best price seen since entry (max mid for BUY, min mid for SELL).
-                       Loaded from DB, updated here if new peak observed.
-        trail_pct:     fractional drawdown from peak that triggers exit.
-        stop_loss_pct: fractional drawdown from ENTRY (not peak) that triggers
-                       exit — e.g. 0.10 = stop fires at 90% of entry price,
-                       regardless of what that entry price actually is.
+        peak_price:      best price seen since entry (max mid for BUY, min mid for SELL).
+                         Loaded from DB, updated here if new peak observed.
+        trail_pct:       fractional drawdown from peak that triggers exit.
+        stop_loss_pct:   fractional drawdown from ENTRY (not peak) that triggers
+                         exit — e.g. 0.10 = stop fires at 90% of entry price,
+                         regardless of what that entry price actually is.
+        force_time_exit: hard 16:00 SGT cutoff (or stale cross-day rollover).
+                         Still evaluated against trailing-stop/stop-loss below —
+                         a forced cutoff must not mask a risk-triggered exit that
+                         happened to land on the same cycle. Confirmed in
+                         production: a 30°C:YES position collapsed within the
+                         final 5-minute window before cutoff and was reported as
+                         a plain TIME_EXIT even though it had already blown
+                         through its stop level, because the old code returned
+                         TIME_EXIT immediately without ever computing stop_level.
     """
     direction = _parse_direction(position_label)
     label     = _parse_bracket(position_label)
 
-    # ── Time exit: no price check needed ──────────────────────────────────────
-    if force_time_exit:
-        market_price = fetch_market_price(token_id)
-        return ExitDecision(
-            token_id=token_id, label=label, direction=direction,
-            reason=ExitReason.TIME_EXIT,
-            entry_price=entry_price, peak_price=peak_price,
-            trail_level=None,
-            current_mid=market_price.mid_price if market_price else entry_price,
-            model_prob=model_prob, market_price=market_price,
-        )
-
     # ── Fetch live price ───────────────────────────────────────────────────────
     market_price = fetch_market_price(token_id)
     if market_price is None:
+        if force_time_exit:
+            logger.warning(f"[MONITOR] {label}: price fetch failed on forced exit — using entry price")
+            return ExitDecision(
+                token_id=token_id, label=label, direction=direction,
+                reason=ExitReason.TIME_EXIT,
+                entry_price=entry_price, peak_price=peak_price, trail_level=None,
+                current_mid=entry_price, model_prob=model_prob, market_price=None,
+            )
         logger.warning(f"[MONITOR] {label}: price fetch failed — skipping")
         return ExitDecision(
             token_id=token_id, label=label, direction=direction,
@@ -213,6 +218,8 @@ def evaluate_exit(
         reason = ExitReason.TRAILING_STOP
     elif stop_trigger:
         reason = ExitReason.STOP_LOSS
+    elif force_time_exit:
+        reason = ExitReason.TIME_EXIT
     else:
         reason = ExitReason.NONE
 
@@ -434,7 +441,13 @@ class PositionMonitor:
                 continue
 
             try:
-                exit_result = self._execute_exit(decision, size_usd, opened_at, market_date)
+                # Log the exit under the POSITION'S OWN market_date, not the
+                # current cycle's — a stale position force-closed after a
+                # day rollover (see force_time_exit above) would otherwise be
+                # recorded in exit_log under tomorrow's date, mislabeling its
+                # trade-history entry and misattributing its P&L to the wrong
+                # day's rollup.
+                exit_result = self._execute_exit(decision, size_usd, opened_at, pos_market_date)
             except Exception as e:
                 logger.error(
                     f"[MONITOR] {position_label}: _execute_exit raised {type(e).__name__}: {e} "
