@@ -99,9 +99,11 @@
   /* ── Open positions ── */
   .pos-card  { background: var(--bg); border: 1px solid var(--border);
                border-radius: 6px; padding: 12px 14px; margin-bottom: 10px; }
-  .pos-top   { display: flex; justify-content: space-between; align-items: baseline; }
-  .pos-label { font-weight: 700; font-size: 14px; color: var(--amber); }
-  .pos-size  { font-family: var(--font-mono); font-size: 13px; }
+  .pos-top   { display: flex; justify-content: space-between; align-items: baseline;
+               flex-wrap: wrap; gap: 4px 12px; }
+  .pos-label { font-weight: 700; font-size: 14px; color: var(--amber); flex: 1 1 auto;
+               min-width: 200px; }
+  .pos-size  { font-family: var(--font-mono); font-size: 13px; flex: 0 0 auto; }
   .pos-row   { font-size: 11px; color: var(--muted); margin-top: 4px; }
   .pos-trail { color: var(--teal); }
   .pos-stop  { color: var(--red); }
@@ -301,7 +303,7 @@
     <table>
       <thead>
         <tr>
-          <th>Closed (SGT)</th><th>Bracket</th><th>Dir</th><th>Exit Reason</th>
+          <th>Closed (SGT)</th><th>Market</th><th>Dir</th><th>Exit Reason</th>
           <th>Entry</th><th>Exit</th><th>Size</th><th>P&amp;L</th>
         </tr>
       </thead>
@@ -595,6 +597,7 @@ function renderPositions(d) {
   el.innerHTML = d.positions.map(p => {
     const label     = p.bracket_label;
     const bracket   = label.split(":")[0];
+    const detail    = p.market_detail || bracket;
     const dir       = p.direction;
     const entry     = +p.entry_price;
     const peak      = +(p.peak_price || entry);
@@ -614,7 +617,7 @@ function renderPositions(d) {
     return `
 <div class="pos-card">
   <div class="pos-top">
-    <span class="pos-label">${bracket} · ${dir}</span>
+    <span class="pos-label">${detail} (${dir})</span>
     <span class="pos-size">$${value.toFixed(2)}</span>
   </div>
   <div class="pos-row">Entry ${entry.toFixed(4)} · Peak ${peak.toFixed(4)} · ${hours}h open</div>
@@ -640,7 +643,7 @@ function renderTrades(d) {
     const exit   = t.exit_price != null ? (+t.exit_price).toFixed(4) : "—";
     return `<tr>
       <td>${closed}</td>
-      <td>${t.bracket_label}</td>
+      <td>${t.market_detail || t.bracket_label}</td>
       <td><span class="badge ${DIR_CLS[t.direction] || ''}">${t.direction}</span></td>
       <td><span class="badge ${REASON_CLS[t.reason] || ''}">${t.reason}</span></td>
       <td>${(+t.entry_price).toFixed(4)}</td>
