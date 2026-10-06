@@ -21,9 +21,7 @@ For NO trades (direction="SELL"):
   A NO position is opened and closed by trading the NO outcome token
   directly (its own separate token_id), via a normal BUY to open / SELL to
   close — mechanically identical to a YES position, just on the other token.
-  Kelly math for NO still uses effective_ask = 1 - best_bid (from the YES
-  book) as a sizing estimate; execution fetches the NO token's own live book
-  for the actual order.
+  Sizing and quality gates use the NO token's own book.
   NO position pays $1 if outcome does NOT occur.
 
 Edge threshold: 8% (0.08) — set in .env as EDGE_THRESHOLD (raised from 5%
@@ -42,6 +40,8 @@ board.
 """
 
 import os
+import datetime
+import math
 import logging
 import requests
 from typing import Dict, Optional, Tuple
@@ -88,6 +88,10 @@ class MarketPrice:
         self.best_ask      = best_ask
         self.spread        = spread       # ask - bid
         self.liquidity_usd = liquidity_usd  # estimated from top-of-book
+        # Full depth + UTC fetch time, for book_snapshots; empty for Gamma prices.
+        self.bids: list = []
+        self.asks: list = []
+        self.fetched_at = ""
 
     def __repr__(self):
         return (
@@ -135,6 +139,9 @@ class EdgeSignal:
         self.no_token_id    = no_token_id
         self.model_prob     = model_prob
         self.market_price   = market_price
+        self.execution_price = market_price  # price of the token actually bought
+        self.market_date = ""
+        self.scanned_at = None
         self.edge           = edge
         self.edge_threshold = edge_threshold
         self.gate_reason    = gate_reason
@@ -174,6 +181,46 @@ class EdgeSignal:
         )
 
 
+def book_levels(book, side: str):
+    """[(price, size), ...] for one side of a REST dict or SDK book."""
+    raw = book.get(side, []) if isinstance(book, dict) else getattr(book, side, None) or []
+    return [(float(x["price"]), float(x["size"])) if isinstance(x, dict)
+            else (float(x.price), float(x.size)) for x in raw]
+
+
+def market_price_from_book(token_id: str, book) -> Optional[MarketPrice]:
+    """Normalize REST dictionaries and SDK books for the same entry gates."""
+    bids, asks = book_levels(book, "bids"), book_levels(book, "asks")
+    if not bids or not asks:
+        return None
+    if any(not math.isfinite(p) or not math.isfinite(s) or not 0 < p < 1 or s <= 0
+           for p, s in bids + asks):
+        return None
+    bid, ask = max(p for p, s in bids), min(p for p, s in asks)
+    if ask <= bid or (bid <= 0.02 and ask >= 0.98):
+        return None
+    liquidity = min(sum(p * s for p, s in sorted(bids, reverse=True)[:3]),
+                    sum(p * s for p, s in sorted(asks)[:3]))
+    price = MarketPrice(token_id, (bid + ask) / 2, bid, ask, round(ask - bid, 5), liquidity)
+    price.bids, price.asks = bids, asks
+    price.fetched_at = datetime.datetime.utcnow().isoformat()
+    return price
+
+
+def entry_gate_reason(price: Optional[MarketPrice], min_liquidity_usd: float = 10.0) -> str:
+    """Check both entry and potential exit depth on the selected outcome token."""
+    if price is None:
+        return ACTION_NO_PRICE
+    if price.mid_price < MIN_ENTRY_PRICE:
+        return ACTION_SKIP_LOW_PRICE
+    floor = max(min_liquidity_usd, LOW_PRICE_LIQUIDITY_FLOOR) if price.mid_price < LOW_PRICE_THRESHOLD else min_liquidity_usd
+    if price.liquidity_usd < floor:
+        return ACTION_SKIP_LIQ
+    if price.spread > 0.08:
+        return ACTION_SKIP_SPRD
+    return ""
+
+
 def fetch_market_price(token_id: str, timeout: int = 10) -> Optional[MarketPrice]:
     """
     Fetch live order book from Polymarket CLOB and extract:
@@ -196,59 +243,11 @@ def fetch_market_price(token_id: str, timeout: int = 10) -> Optional[MarketPrice
         resp.raise_for_status()
         book = resp.json()
 
-        bids = book.get("bids", [])
-        asks = book.get("asks", [])
-
-        if not bids or not asks:
-            logger.warning(f"[EDGE] Empty book for {token_id[:12]}... — trying Gamma")
+        price = market_price_from_book(token_id, book)
+        if price is None:
+            logger.warning(f"[EDGE] Unusable book for {token_id[:12]} — trying Gamma")
             return _fetch_price_from_gamma(token_id, timeout)
-
-        # Best bid = highest price in bids, best ask = lowest price in asks
-        best_bid = max(float(b["price"]) for b in bids)
-        best_ask = min(float(a["price"]) for a in asks)
-
-        if best_ask <= best_bid:
-            logger.warning(
-                f"[EDGE] Crossed book for {token_id[:12]}: "
-                f"bid={best_bid:.4f} ask={best_ask:.4f} — skipping"
-            )
-            return None
-
-        # Ghost-book detection (Polymarket py-clob-client issue #180):
-        # The /book REST endpoint intermittently returns a stale "ghost" snapshot
-        # of bid=0.01 / ask=0.99 for active, liquid markets, while /price stays
-        # accurate. A 0.01/0.99 book is almost never real for a weather bracket
-        # mid-day. Treat it as unavailable and fall back to Gamma rather than
-        # trading against a fake 0.50 mid with a 0.98 spread.
-        if best_bid <= 0.02 and best_ask >= 0.98:
-            logger.warning(
-                f"[EDGE] Ghost book for {token_id[:12]} (bid={best_bid:.2f} "
-                f"ask={best_ask:.2f}) — issue #180, falling back to Gamma"
-            )
-            return _fetch_price_from_gamma(token_id, timeout)
-
-        mid_price = (best_bid + best_ask) / 2.0
-        spread    = best_ask - best_bid
-
-        # Liquidity on BOTH sides: BUY YES fills into asks, SELL YES (NO) fills
-        # into bids. Measuring only the ask side (the old behaviour) let a book
-        # with fat asks but thin bids pass the liquidity gate, after which a
-        # SELL/NO execution would fail to fill. We store the min of the two so
-        # the gate reflects whichever side a trade would actually hit.
-        top_asks     = sorted(asks, key=lambda x: float(x["price"]))[:3]
-        top_bids     = sorted(bids, key=lambda x: float(x["price"]), reverse=True)[:3]
-        ask_liq_usd  = sum(float(a["price"]) * float(a["size"]) for a in top_asks)
-        bid_liq_usd  = sum(float(b["price"]) * float(b["size"]) for b in top_bids)
-        liquidity_usd = min(ask_liq_usd, bid_liq_usd)
-
-        return MarketPrice(
-            token_id      = token_id,
-            mid_price     = round(mid_price, 5),
-            best_bid      = round(best_bid, 5),
-            best_ask      = round(best_ask, 5),
-            spread        = round(spread, 5),
-            liquidity_usd = round(liquidity_usd, 2),
-        )
+        return price
 
     except Exception as e:
         logger.warning(f"[EDGE] CLOB book fetch failed for {token_id[:12]}: {e}")
@@ -313,130 +312,24 @@ def compute_edge(
     max_edge_magnitude: float = MAX_EDGE_MAGNITUDE,
     no_token_id: Optional[str] = None,
 ) -> EdgeSignal:
-    """
-    Compute edge for one bracket. Always returns EdgeSignal (never None).
-    Non-actionable signals carry gate_reason explaining why they were blocked.
+    """Find direction from YES pricing, then gate the token actually bought."""
+    price = fetch_market_price(token_id)
+    edge = model_prob - price.mid_price if price else 0.0
+    selected_price = price
+    if price is None:
+        reason = ACTION_NO_PRICE
+    elif abs(edge) > max_edge_magnitude:
+        reason = ACTION_SKIP_EXTREME
+    elif price.liquidity_usd < 0:
+        reason = ACTION_SKIP_LIQ  # Gamma prices are display-only.
+    else:
+        if edge <= -edge_threshold:
+            selected_price = fetch_market_price(no_token_id) if no_token_id else None
+        reason = entry_gate_reason(selected_price, min_liquidity_usd)
 
-    Liquidity gate: skip if top-of-book liquidity < min_liquidity_usd.
-    This blocks entry into markets where even a $25 order would move the price.
-
-    Extreme-edge gate: skip if |edge| > max_edge_magnitude. A well-liquidity,
-    tight-spread market implying near-certainty of the OPPOSITE of what the
-    model says is more often evidence the model's stated uncertainty is too
-    tight than evidence of a huge mispriced opportunity — see module
-    docstring. Checked before the liquidity/spread gates since it's a
-    data-sanity concern independent of market microstructure.
-    """
-    market_price = fetch_market_price(token_id)
-
-    if market_price is None:
-        logger.warning(f"[EDGE] {bracket_label}: price fetch failed")
-        return EdgeSignal(
-            bracket_label=bracket_label, token_id=token_id,
-            model_prob=model_prob, market_price=None,
-            edge=0.0, edge_threshold=edge_threshold,
-            gate_reason=ACTION_NO_PRICE,
-            no_token_id=no_token_id,
-        )
-
-    edge = model_prob - market_price.mid_price
-
-    # Extreme-edge sanity gate — see compute_edge()'s docstring.
-    if abs(edge) > max_edge_magnitude:
-        logger.warning(
-            f"[EDGE] {bracket_label}: |edge|={abs(edge):.3f} > cap {max_edge_magnitude:.2f} "
-            f"(model={model_prob:.3f} market={market_price.mid_price:.3f}) — "
-            f"gated as likely miscalibration, not traded"
-        )
-        return EdgeSignal(
-            bracket_label=bracket_label, token_id=token_id,
-            model_prob=model_prob, market_price=market_price,
-            edge=edge, edge_threshold=edge_threshold,
-            gate_reason=ACTION_SKIP_EXTREME,
-            no_token_id=no_token_id,
-        )
-
-    # Minimum entry price gate — a cheap long-shot token needs proportionally
-    # more shares to fill the same $ notional, which is exactly the segment
-    # where entry-time liquidity checks are least predictive of exit-time
-    # slippage (see LOW_PRICE_THRESHOLD comment above). Checked before the
-    # liquidity gate since it's a blanket price-range decision, not a
-    # book-depth measurement.
-    if market_price.mid_price < MIN_ENTRY_PRICE:
-        logger.info(
-            f"[EDGE] {bracket_label}: price {market_price.mid_price:.4f} < "
-            f"min entry {MIN_ENTRY_PRICE} — gated (thin-book exit slippage risk)"
-        )
-        return EdgeSignal(
-            bracket_label=bracket_label, token_id=token_id,
-            model_prob=model_prob, market_price=market_price,
-            edge=edge, edge_threshold=edge_threshold,
-            gate_reason=ACTION_SKIP_LOW_PRICE,
-            no_token_id=no_token_id,
-        )
-
-    # Liquidity gate — blocks two cases:
-    #   1. Gamma-fallback prices (liquidity_usd == -1.0): depth unknown, so we
-    #      have a signal for the dashboard but must not execute against a
-    #      fabricated spread.
-    #   2. Real books too thin to absorb a min-size order without moving price
-    #      (0 <= liquidity_usd < floor).
-    # Cheap brackets (< LOW_PRICE_THRESHOLD) get a higher floor: the same $
-    # of top-of-book liquidity covers far fewer real dollars of slippage
-    # margin once you're already down near a few cents.
-    if market_price.liquidity_usd < 0:
-        logger.info(
-            f"[EDGE] {bracket_label}: price via Gamma fallback (depth unknown) — "
-            f"gated from execution"
-        )
-        return EdgeSignal(
-            bracket_label=bracket_label, token_id=token_id,
-            model_prob=model_prob, market_price=market_price,
-            edge=edge, edge_threshold=edge_threshold,
-            gate_reason=ACTION_SKIP_LIQ,
-            no_token_id=no_token_id,
-        )
-    effective_liq_floor = (
-        max(min_liquidity_usd, LOW_PRICE_LIQUIDITY_FLOOR)
-        if market_price.mid_price < LOW_PRICE_THRESHOLD
-        else min_liquidity_usd
-    )
-    if market_price.liquidity_usd < effective_liq_floor:
-        logger.info(
-            f"[EDGE] {bracket_label}: liquidity ${market_price.liquidity_usd:.2f} "
-            f"< floor ${effective_liq_floor:.2f} — gated"
-        )
-        return EdgeSignal(
-            bracket_label=bracket_label, token_id=token_id,
-            model_prob=model_prob, market_price=market_price,
-            edge=edge, edge_threshold=edge_threshold,
-            gate_reason=ACTION_SKIP_LIQ,
-            no_token_id=no_token_id,
-        )
-
-    # Spread gate
-    if market_price.spread > 0.08:
-        logger.info(
-            f"[EDGE] {bracket_label}: spread={market_price.spread:.3f} > 0.08 — gated"
-        )
-        return EdgeSignal(
-            bracket_label=bracket_label, token_id=token_id,
-            model_prob=model_prob, market_price=market_price,
-            edge=edge, edge_threshold=edge_threshold,
-            gate_reason=ACTION_SKIP_SPRD,
-            no_token_id=no_token_id,
-        )
-
-    signal = EdgeSignal(
-        bracket_label  = bracket_label,
-        token_id       = token_id,
-        model_prob     = model_prob,
-        market_price   = market_price,
-        edge           = edge,
-        edge_threshold = edge_threshold,
-        gate_reason    = "",
-        no_token_id    = no_token_id,
-    )
+    signal = EdgeSignal(bracket_label, token_id, model_prob, price, edge,
+                        edge_threshold, reason, no_token_id)
+    signal.execution_price = selected_price
     logger.info(str(signal))
     return signal
 

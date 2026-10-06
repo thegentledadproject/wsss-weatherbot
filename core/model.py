@@ -140,7 +140,7 @@ class ForecastResult:
         return f"ForecastResult({', '.join(parts)})"
 
 
-def _fetch_ensemble_members(url: str, timeout: int, model_name: str) -> Optional[Tuple[float, float, int]]:
+def _fetch_ensemble_members(url: str, timeout: int, model_name: str, market_date: str) -> Optional[Tuple[float, float, int]]:
     """
     Fetch ensemble members from Open-Meteo and compute (mu, sigma, n_members).
     Returns None on any failure.
@@ -151,7 +151,10 @@ def _fetch_ensemble_members(url: str, timeout: int, model_name: str) -> Optional
     sigma = std dev of member daily maxes (ddof=1), clipped to [0.30, 2.00]
     """
     try:
-        resp = requests.get(url.format(lat=WSSS_LAT, lon=WSSS_LON), timeout=timeout)
+        resp = requests.get(
+            url.replace("&forecast_days=1", "").format(lat=WSSS_LAT, lon=WSSS_LON),
+            params={"start_date": market_date, "end_date": market_date}, timeout=timeout,
+        )
         resp.raise_for_status()
         data   = resp.json()
         hourly = data.get("hourly", {})
@@ -168,7 +171,8 @@ def _fetch_ensemble_members(url: str, timeout: int, model_name: str) -> Optional
         # never matched (t[11:] has no leading 'T'), so peak_idx was always empty,
         # every ensemble fetch returned None, and the forecast fell back to the
         # hard prior on EVERY scan — the root cause of model_mu=31.5 in the logs.
-        peak_idx = [i for i, t in enumerate(times) if len(t) >= 16 and "06:00" <= t[11:16] <= "21:00"]
+        peak_idx = [i for i, t in enumerate(times)
+                    if len(t) >= 16 and t[:10] == market_date and "06:00" <= t[11:16] <= "21:00"]
         if not peak_idx:
             logger.warning(f"[MODEL] {model_name}: no peak-hour indices found")
             return None
@@ -258,7 +262,7 @@ def _blend(
     return ForecastResult(mu=0.0, sigma=0.0, source="none")
 
 
-def fetch_gfs_forecast(timeout: int = 15) -> ForecastResult:
+def fetch_gfs_forecast(timeout: int = 15, market_date: Optional[str] = None) -> ForecastResult:
     """
     Fetch dual-source forecast and return blended ForecastResult.
 
@@ -270,9 +274,12 @@ def fetch_gfs_forecast(timeout: int = 15) -> ForecastResult:
       5. If that fails → hard prior, BLOCK TRADING
     """
 
+    if market_date is None:
+        market_date = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).date().isoformat()
+    datetime.date.fromisoformat(market_date)
     # ── Fetch both ensemble sources ───────────────────────────────────────────
-    gfs_result   = _fetch_ensemble_members(GFS_ENSEMBLE_URL,   timeout, "GFS")
-    ecmwf_result = _fetch_ensemble_members(ECMWF_ENSEMBLE_URL, timeout, "ECMWF")
+    gfs_result   = _fetch_ensemble_members(GFS_ENSEMBLE_URL,   timeout, "GFS", market_date)
+    ecmwf_result = _fetch_ensemble_members(ECMWF_ENSEMBLE_URL, timeout, "ECMWF", market_date)
 
     blended = _blend(gfs_result, ecmwf_result)
     if blended.source != "none":
@@ -281,13 +288,14 @@ def fetch_gfs_forecast(timeout: int = 15) -> ForecastResult:
     # ── Fallback 1: standard forecast API (GFS deterministic) ────────────────
     logger.warning("[MODEL] Both ensemble sources failed — trying standard GFS forecast API")
     try:
-        url  = OPEN_METEO_FORECAST_URL.format(lat=WSSS_LAT, lon=WSSS_LON)
-        resp = requests.get(url, timeout=timeout)
+        url = OPEN_METEO_FORECAST_URL.replace("&forecast_days=1", "").format(lat=WSSS_LAT, lon=WSSS_LON)
+        resp = requests.get(url, params={"start_date": market_date, "end_date": market_date}, timeout=timeout)
         resp.raise_for_status()
         data  = resp.json()
         daily = data.get("daily", {})
-        t_max = daily.get("temperature_2m_max", [None])[0]
-        t_min = daily.get("temperature_2m_min", [None])[0]
+        day_index = daily.get("time", []).index(market_date)
+        t_max = daily["temperature_2m_max"][day_index]
+        t_min = daily["temperature_2m_min"][day_index]
 
         if t_max is not None:
             mu = float(t_max)
@@ -334,11 +342,14 @@ class BracketModel:
         self,
         forecast: ForecastResult,
         month: Optional[int] = None,
+        observed_high: Optional[float] = None,
     ) -> Dict[str, float]:
         """
         Returns {bracket_label: probability} for all defined brackets.
         Probabilities sum to < 1.0 (remainder = tails outside [29.0, 34.0)).
         Returns {} if forecast source is "fallback" or "none" — no trading.
+        observed_high conditions today's daily-max distribution on the WSSS
+        high already reported; brackets below it have exactly zero probability.
 
         Sigma blending: forecast.sigma comes from ensemble MEMBER SPREAD on a
         single run — it measures how much the models disagree with each
@@ -384,6 +395,20 @@ class BracketModel:
         )
 
         probs: Dict[str, float] = {}
+        if observed_high is not None:
+            # ponytail: truncate the daily-max forecast at observed high; model remaining hours if calibration needs it.
+            remaining = skewnorm.sf(observed_high, alpha, loc=cal_mu, scale=effective_sigma)
+            if not np.isfinite(remaining) or remaining <= 0:
+                logger.error("[MODEL] Observed high is outside the forecast's numerical support — no trading")
+                return {}
+            for label, (lo, hi) in BRACKETS.items():
+                if hi <= observed_high:
+                    probs[label] = 0.0
+                else:
+                    p = (skewnorm.sf(max(lo, observed_high), alpha, loc=cal_mu, scale=effective_sigma)
+                         - skewnorm.sf(hi, alpha, loc=cal_mu, scale=effective_sigma)) / remaining
+                    probs[label] = max(0.0, min(1.0, float(p)))
+            return probs
         for label, (lo, hi) in BRACKETS.items():
             p = (
                 skewnorm.cdf(hi, alpha, loc=cal_mu, scale=effective_sigma)

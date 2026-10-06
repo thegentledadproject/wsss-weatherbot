@@ -120,9 +120,8 @@ def main():
 
     engine = ExecutionEngine(client, ledger, vault_usd=args.size, icao=args.icao)
 
-    # ExecutionEngine.execute() only reads bracket_label/direction/token_id/
-    # no_token_id off the signal — a SimpleNamespace avoids fighting
-    # EdgeSignal's own auto-computed direction/actionable gating logic.
+    # Manual entries explicitly bypass signal freshness and model-edge checks.
+    # Selected-token quality checks and confirmed fill recording still apply.
     signal = SimpleNamespace(
         bracket_label=bracket,
         direction=direction,
@@ -140,7 +139,7 @@ def main():
     )
 
     print(f"\nExecuting BUY {args.side} {bracket} ${sizing.size_usd:.2f} ...")
-    filled = engine.execute(signal, sizing, market_date=args.date)
+    filled = engine.execute(signal, sizing, market_date=args.date, bypass_edge_checks=True)
 
     if filled:
         print(f"\n✓ FILLED — position recorded for {bracket} [{args.side}].")
