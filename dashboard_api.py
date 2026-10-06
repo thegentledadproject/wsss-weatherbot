@@ -443,8 +443,8 @@ def latest_scan():
     liquidity/spread — each with its model prob, market price, and edge.
     """
     latest = _rows(
-        "SELECT id, date, bracket_label, model_prob, market_price, edge, "
-        "action, COALESCE(gate_reason,'') as gate_reason "
+        "SELECT id, timestamp, date, bracket_label, model_prob, market_price, edge, "
+        "action, observed_high, observed_at, forecast_source, COALESCE(gate_reason,'') as gate_reason "
         "FROM signal_log ORDER BY id DESC LIMIT 40"
     )
     if not latest:
@@ -454,7 +454,7 @@ def latest_scan():
     # Keep the most recent row per bracket (highest id)
     seen = {}
     for r in latest:
-        if r["bracket_label"] not in seen:
+        if r["date"] == latest[0]["date"] and r["bracket_label"] not in seen:
             seen[r["bracket_label"]] = r
     scan = sorted(seen.values(), key=lambda r: r["bracket_label"])
 
@@ -472,6 +472,7 @@ def latest_scan():
         "SKIP_SPREAD":    ("GATED", "spread > 8c",        False),
         "SKIP_EXTREME_EDGE": ("GATED", "implausible edge — likely miscalibration", False),
         "NO_PRICE":       ("GATED", "no price",           False),
+        "SKIP_LOW_PRICE": ("GATED", "entry price below floor", False),
     }
     for r in scan:
         status, label, passed = STATUS.get(r["action"], ("HOLD", "hold", False))
@@ -486,6 +487,11 @@ def latest_scan():
     return {
         "scan":           scan,
         "scan_date":      latest[0]["date"],
+        "scanned_at": latest[0]["timestamp"] + "Z",
+        "scan_stale": (datetime.datetime.utcnow() - datetime.datetime.fromisoformat(latest[0]["timestamp"])).total_seconds() > 900,
+        "observed_high": latest[0]["observed_high"],
+        "observed_at": latest[0]["observed_at"],
+        "forecast_source": latest[0]["forecast_source"],
         "edge_threshold": THRESH,
         "n_brackets":     len(scan),
         "n_passed":       n_pass,

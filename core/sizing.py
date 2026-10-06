@@ -40,12 +40,14 @@ Changes from v4.5:
 
 import os
 import logging
+import math
 from typing import Any, Optional
 
 logger = logging.getLogger("hermes.sizing")
 
 TAKER_FEE_RATE    = 0.02    # Polymarket maker/taker fee
 GAS_COST_USD      = 0.05    # Polygon gas estimate
+NET_EV_HURDLE     = 0.025   # Existing standard hurdle, also used for fixed sizing
 MAX_POSITION_PCT  = 0.05    # Cap at 5% of vault per trade
 
 # Runtime-configurable via .env — defaults match v4.5 option 2 & 3 fix
@@ -224,7 +226,7 @@ def compute_size(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# VALIDATION MODE — forced $1 sizing, no Kelly/EV gating
+# FIXED SIZE — no Kelly sizing; net EV is checked before entry
 # ══════════════════════════════════════════════════════════════════════════════
 VALIDATION_POSITION_USD  = float(os.getenv("VALIDATION_POSITION_USD", "1.00"))
 
@@ -238,42 +240,31 @@ VALIDATION_POSITION_USD  = float(os.getenv("VALIDATION_POSITION_USD", "1.00"))
 MAX_SHARES_PER_POSITION = float(os.getenv("MAX_SHARES_PER_POSITION", "10"))
 
 
+def net_expected_value(prob: float, price: float, size_usd: float) -> float:
+    """Expected return per dollar using the bot's fee and gas estimates."""
+    return prob / price - 1.0 - TAKER_FEE_RATE - GAS_COST_USD / size_usd
+
+
 def compute_validation_size(
     model_prob: float,
     market_ask: float,
     direction: str = "BUY",
 ) -> SizingResult:
+    """Fixed-dollar sizing capped by shares, requiring the standard net EV hurdle.
+
+    The historical name is retained for callers; this is the permanent sizing
+    path. Execution repeats the cost and edge checks at its worst-price limit.
     """
-    Forced fixed-$ sizing (VALIDATION_POSITION_USD, default $1.00), capped by
-    share count for cheap entries (MAX_SHARES_PER_POSITION, default 15).
-
-    Originally built for end-to-end mechanics validation before deploying
-    real capital; scheduler.py now calls this unconditionally as the
-    permanent sizing path (Kelly/vault sizing via compute_size() is disabled
-    but left intact above for future re-enable).
-
-    Bypasses Kelly fraction, the vault-relative cap/floor, and both EV
-    hurdles entirely. Trades on ANY actionable edge signal regardless of net
-    EV after fees. Real gross_ev and net_ev are still computed and attached
-    to the result for logging/research — only the gating is skipped.
-
-    At $1 size, gas ($0.05) alone is 5% drag and taker fee adds another 2%,
-    so net_ev will frequently print negative even on genuine edge signals.
-    This is expected and accepted — the point is fixed, predictable exposure
-    per trade, not fee-optimal sizing.
-
-    Returns SizingResult with verdict="EXECUTE" unconditionally (caller in
-    scheduler.py only invokes this for already-actionable EdgeSignals, so
-    there is always a real edge — just not necessarily a profitable one
-    after $1-scale fees).
-    """
-    if market_ask <= 0.01 or market_ask >= 0.99:
+    if not 0.01 < market_ask < 0.99 or not 0 <= model_prob <= 1:
         return SizingResult(
             "HOLD", direction, 0.0, 0.0, 0.0, 0.0,
             "ask_price_out_of_range (validation mode still respects this)",
         )
 
     size_usd = VALIDATION_POSITION_USD
+    if not (math.isfinite(size_usd) and math.isfinite(MAX_SHARES_PER_POSITION)
+            and size_usd > 0 and MAX_SHARES_PER_POSITION > 0):
+        return SizingResult("HOLD", direction, 0.0, 0.0, 0.0, 0.0, "invalid_position_size")
     implied_shares = size_usd / market_ask
     if implied_shares > MAX_SHARES_PER_POSITION:
         size_usd = round(MAX_SHARES_PER_POSITION * market_ask, 4)
@@ -289,13 +280,14 @@ def compute_validation_size(
     b = (1.0 - market_ask) / market_ask
     gross_ev = (p * b) - q
 
-    gas_frac = GAS_COST_USD / size_usd
-    net_ev   = gross_ev - (TAKER_FEE_RATE + gas_frac)
+    net_ev = net_expected_value(p, market_ask, size_usd)
+    if net_ev <= NET_EV_HURDLE:
+        return SizingResult("HOLD", direction, 0.0, net_ev, gross_ev, 0.0, "net_ev_below_hurdle")
 
     logger.info(
-        f"[SIZING] VALIDATION_MODE: forcing ${size_usd:.2f} "
+        f"[SIZING] Fixed size ${size_usd:.2f} "
         f"(gross_ev={gross_ev*100:+.2f}% net_ev={net_ev*100:+.2f}% "
-        f"— gating skipped, fee drag at this size is {gas_frac*100:.1f}% from gas alone)"
+        f"— net EV hurdle {NET_EV_HURDLE*100:.1f}%)"
     )
 
     return SizingResult(
@@ -305,5 +297,5 @@ def compute_validation_size(
         round(net_ev, 5),
         round(gross_ev, 5),
         0.0,   # kelly_raw not applicable in validation mode
-        "validation_mode_forced",
+        "fixed_size",
     )

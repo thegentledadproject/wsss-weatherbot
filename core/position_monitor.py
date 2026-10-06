@@ -452,7 +452,8 @@ class PositionMonitor:
                 # recorded in exit_log under tomorrow's date, mislabeling its
                 # trade-history entry and misattributing its P&L to the wrong
                 # day's rollup.
-                exit_result = self._execute_exit(decision, size_usd, opened_at, pos_market_date)
+                exit_result = self._execute_exit(decision, size_usd, opened_at, pos_market_date,
+                                                 scan_id=pos["scan_id"])
             except Exception as e:
                 logger.error(
                     f"[MONITOR] {position_label}: _execute_exit raised {type(e).__name__}: {e} "
@@ -469,6 +470,7 @@ class PositionMonitor:
         size_usd:    float,
         opened_at:   str,
         market_date: str = "",
+        scan_id:     Optional[int] = None,
     ) -> Dict:
         token_id  = decision.token_id
         label     = decision.label
@@ -588,7 +590,7 @@ class PositionMonitor:
                 reason=reason, entry_price=decision.entry_price,
                 exit_price=exit_vwap, size_usd=size_usd,
                 realised_pnl=realised_pnl, opened_at=opened_at,
-                market_date=market_date,
+                market_date=market_date, scan_id=scan_id,
             )
             return self._result(decision, size_usd, opened_at, exit_vwap, True, reason, realised_pnl)
 

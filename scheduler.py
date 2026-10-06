@@ -86,6 +86,10 @@ import logging
 import datetime
 import signal
 import sys
+import time
+import threading
+from functools import wraps
+import requests
 
 from dotenv import load_dotenv
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -107,6 +111,7 @@ logger = logging.getLogger("hermes.scheduler")
 from db.ledger       import Ledger
 from core.discovery  import MarketDiscovery
 from core.model      import BracketModel, fetch_gfs_forecast
+from core.observations import fetch_daily_observations
 from core.edge       import scan_all_brackets
 
 # Kelly/vault sizing (compute_size, check_sizing_config, KELLY_FRACTION,
@@ -115,7 +120,7 @@ from core.edge       import scan_all_brackets
 # size via compute_validation_size() instead of being sized against a vault
 # balance. Re-import compute_size/check_sizing_config here to re-enable it.
 from core.sizing     import compute_validation_size
-from core.execution  import ExecutionEngine, build_client
+from core.execution  import ExecutionEngine, build_client, signal_is_current
 from core.settlement    import SettlementEngine
 from core.position_monitor import PositionMonitor
 
@@ -145,6 +150,16 @@ _state: dict = {
 # ── Shared singletons ──────────────────────────────────────────────────────────
 _ledger    = Ledger(DB_PATH)
 _client    = None   # initialised in main() to catch auth errors early
+_entry_lock = threading.RLock()
+
+
+def _serialized_entry_job(job):
+    @wraps(job)
+    def run():
+        # ponytail: serialize discovery/scan/entry; use atomic snapshots if throughput demands it.
+        with _entry_lock:
+            return job()
+    return run
 
 
 def _sg_now() -> datetime.datetime:
@@ -154,6 +169,7 @@ def _sg_now() -> datetime.datetime:
 # ══════════════════════════════════════════════════════════════════════════════
 # JOB 1 — Market Discovery (every 20 min, 24/7 — self-healing)
 # ══════════════════════════════════════════════════════════════════════════════
+@_serialized_entry_job
 def job_market_discovery():
     sg_now     = _sg_now()
     today      = sg_now.strftime("%Y-%m-%d")
@@ -191,7 +207,9 @@ def job_market_discovery():
         # rollover always clears the cache and updates market_date below,
         # even when today's real event hasn't been found yet — Jobs 2/3
         # correctly see "no matrix" and skip until discovery catches up.
-        if _state.get("token_matrix") and not is_rollover:
+        if discovery.invalid_reason:
+            logger.error(f"[JOB1] Settlement gate: {discovery.invalid_reason} — clearing matrix, no entries.")
+        elif _state.get("token_matrix") and not is_rollover:
             logger.warning(
                 "[JOB1] No fresh tokens found this cycle — keeping previously "
                 "cached matrix until next retry."
@@ -214,20 +232,26 @@ def job_market_discovery():
             logger.warning("[JOB1] Validation failed — re-running discovery.")
             matrix = discovery.run(date)
 
+    if date != prior_date or matrix != _state.get("token_matrix"):
+        _state["signals"] = {}
     _state["token_matrix"] = matrix
     _state["market_date"]  = date
     logger.info(f"[JOB1] Token matrix: {list(matrix.keys())}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# JOB 2 — Signal Scan (every 15 min, 08:00–17:30 SGT)
+# JOB 2 — Signal Scan (every 15 min, 24/7)
 # ══════════════════════════════════════════════════════════════════════════════
+@_serialized_entry_job
 def job_signal_scan():
     sg_now_str = _sg_now().strftime("%H:%M SGT")
     logger.info(f"[JOB2] ── Signal Scan @ {sg_now_str} ────────────────────────────────")
 
     token_matrix = _state.get("token_matrix", {})
-    if not token_matrix:
+    scan_date = _state.get("market_date", "")
+    scanned_at = time.time()
+    _state["signals"] = {}  # Never reuse a previous scan if this one fails.
+    if not token_matrix or not scan_date:
         logger.warning("[JOB2] No token matrix — skipping scan. Run Job 1 first.")
         # Clear any signals left over from a prior cycle — without this,
         # Job 3 would keep reading yesterday's already-actionable signals
@@ -239,7 +263,7 @@ def job_signal_scan():
         return
 
     # Fetch live GFS forecast (ensemble sigma)
-    forecast = fetch_gfs_forecast()
+    forecast = fetch_gfs_forecast(market_date=scan_date)
     _state["forecast"] = forecast
 
     if forecast.source == "fallback":
@@ -256,7 +280,18 @@ def job_signal_scan():
     model         = BracketModel(
         trailing_bias=trailing_bias, icao=ICAO, historical_sigma=historical_sigma,
     )
-    model_probs   = model.compute(forecast)
+    observations = None
+    if scan_date == _sg_now().date().isoformat():
+        try:
+            observations = fetch_daily_observations(scan_date)
+            logger.info(f"[JOB2] NOAA WSSS: high={observations['high_c']:.1f}°C at {observations['observed_at']}")
+        except (requests.RequestException, ValueError) as exc:
+            logger.error(f"[JOB2] NOAA observations unavailable — no fresh entries: {exc}")
+            return
+    model_probs = model.compute(
+        forecast, month=datetime.date.fromisoformat(scan_date).month,
+        observed_high=observations["high_c"] if observations else None,
+    )
 
     if not model_probs:
         logger.error("[JOB2] Model returned empty probs — aborting scan.")
@@ -267,7 +302,6 @@ def job_signal_scan():
     # Keyed by market_date (not overwritten across days) so Job 4 can never
     # accidentally log a settlement residual against a DIFFERENT day's
     # forecast — see _state's docstring above for the incident this fixes.
-    scan_date = _state.get("market_date", _sg_now().strftime("%Y-%m-%d"))
     _state["model_mu_by_date"][scan_date] = forecast.mu
 
     # Edge scan: model prob vs live market mid-price
@@ -277,11 +311,23 @@ def job_signal_scan():
         edge_threshold     = EDGE_THRESHOLD,
         max_edge_magnitude = MAX_EDGE_MAGNITUDE,
     )
+    scan_id = _ledger.log_scan(
+        datetime.datetime.utcfromtimestamp(scanned_at).isoformat(), scan_date, forecast,
+        trailing_bias, historical_sigma, observations, model_probs,
+    )
+    for signal in signals.values():
+        signal.market_date = scan_date
+        signal.scanned_at = scanned_at
+        signal.scan_id = scan_id
+        signal.observed_at = observations["observed_at"] if observations else ""
+        for price in {id(p): p for p in (signal.market_price, signal.execution_price) if p}.values():
+            if price.bids or price.asks:  # Gamma fallback prices carry no book
+                _ledger.log_book(scan_id, price.token_id, "scan", price.bids, price.asks, price.fetched_at)
     _state["signals"] = signals
 
     # Log ALL signals to DB — including non-actionable, gated, and held
     # This is the change that lets the dashboard show the full scan picture.
-    date = _state.get("market_date", _sg_now().strftime("%Y-%m-%d"))
+    date = scan_date
     for label, sig in signals.items():
         mid = sig.market_price.mid_price if sig.market_price else 0.0
         _ledger.log_signal(
@@ -291,6 +337,11 @@ def job_signal_scan():
             market_price  = mid,
             edge          = sig.edge,
             action        = sig.action_label,   # includes HOLD_EDGE, SKIP_*, NO_PRICE
+            gate_reason   = sig.gate_reason,
+            observed_high = observations["high_c"] if observations else None,
+            observed_at   = observations["observed_at"] if observations else "",
+            forecast_source = forecast.source,
+            scan_id       = scan_id,
         )
 
     buys  = [l for l, s in signals.items() if s.direction == "BUY"  and s.actionable]
@@ -307,6 +358,7 @@ def job_signal_scan():
 # ══════════════════════════════════════════════════════════════════════════════
 # JOB 3 — Order Execution (every 15 min, 08:00–17:30 SGT)
 # ══════════════════════════════════════════════════════════════════════════════
+@_serialized_entry_job
 def job_order_execution():
     sg_now_str = _sg_now().strftime("%H:%M SGT")
     logger.info(f"[JOB3] ── Order Execution @ {sg_now_str} ─────────────────────────────")
@@ -331,17 +383,14 @@ def job_order_execution():
     for label, signal in actionable.items():
         direction = signal.direction  # "BUY" or "SELL"
 
-        # effective_ask kept for logging/EV visibility even though sizing no
-        # longer depends on it (fixed-$ sizing below doesn't need a bankroll-
-        # relative bet size, just the win probability implied by the price).
-        # For BUY YES: best_ask (cost to buy)
-        # For SELL YES (NO): effective_ask = 1 - best_bid
-        #   because buying NO at implied price (1 - bid) is what we're sizing.
-        #   e.g. 33°C bid=0.20 → effective_ask for NO = 1 - 0.20 = 0.80
-        if direction == "BUY":
-            effective_ask = signal.market_price.best_ask
-        else:
-            effective_ask = 1.0 - signal.market_price.best_bid
+        ids = _state.get("token_matrix", {}).get(label, {})
+        if (not signal_is_current(signal, _state.get("market_date", ""))
+                or ids.get("yes") != signal.token_id or (ids.get("no") or None) != signal.no_token_id):
+            logger.warning(f"[JOB3] {label}: expired or mismatched signal — skipping")
+            continue
+
+        # Size against the actual YES or NO ask observed by the scan.
+        effective_ask = signal.execution_price.best_ask
 
         # signal.model_prob is always P(bracket occurs) — i.e. P(YES).
         # win_prob must be the win probability of the SIDE BEING SIZED:
@@ -349,12 +398,7 @@ def job_order_execution():
         #   SELL/NO → wins if the bracket does NOT occur  → p = 1 - model_prob
         win_prob = signal.model_prob if direction == "BUY" else 1.0 - signal.model_prob
 
-        # Fixed-$ sizing (see core.sizing.compute_validation_size): every
-        # actionable signal trades at VALIDATION_POSITION_USD (.env, default
-        # $1.00) regardless of edge magnitude — no Kelly fraction, no vault-
-        # relative cap/floor, no net-EV/fee hurdle. Only core/edge.py's own
-        # gates (threshold, extreme-edge, liquidity, spread) decide whether a
-        # signal is actionable in the first place.
+        # Fixed-dollar sizing with share cap and the standard net EV hurdle.
         sizing = compute_validation_size(
             model_prob = win_prob,
             market_ask = effective_ask,
@@ -363,7 +407,7 @@ def job_order_execution():
         logger.info(f"[JOB3] {label} [{direction}]: {sizing}")
 
         if sizing.verdict == "EXECUTE":
-            market_date_for_entry = _state.get("market_date", _sg_now().strftime("%Y-%m-%d"))
+            market_date_for_entry = signal.market_date
             filled = engine.execute(signal, sizing, market_date=market_date_for_entry)
             if filled:
                 logger.info(
@@ -566,7 +610,7 @@ def main():
     # Explicit timezone for all jobs — avoids UTC fallback on VPS without pytz
     _SGT = "Asia/Singapore"
 
-    # Jobs 1-4 — restricted to 23:00-17:00 SGT (hour="23,0-16": wraps
+    # Jobs 1, 3, 4 — restricted to 23:00-17:00 SGT (hour="23,0-16": wraps
     # midnight — 23 plus the 0-16 range; last tick each job is whichever of
     # its own minute offsets falls before 17:00 — e.g. Job 2's last tick is
     # 16:45, Job 3's is 16:47). Widened from 01:00-17:00 to start at 23:00
@@ -593,14 +637,13 @@ def main():
         max_instances = 1,
     )
 
-    # Job 2 — Signal scan: every 15 min.
+    # Job 2 — Signal scan: every 15 min, 24/7; entry hours remain restricted.
     # Market quality gates (liquidity floor, spread cap in core/edge.py)
     # already suppress bad signals on thin overnight books.
     scheduler.add_job(
         job_signal_scan,
         trigger   = "cron",
         minute    = "0,15,30,45",
-        hour      = HOURS,
         timezone  = _SGT,
         id        = "signal_scan",
         name      = "Signal Scan",

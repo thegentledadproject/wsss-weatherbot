@@ -234,7 +234,7 @@
   <div class="panel" style="margin-bottom:16px">
     <div class="panel-title">
       Latest scan — all brackets this cycle
-      <span id="scan-summary" style="color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0;margin-left:8px"></span>
+      <span id="scan-summary" style="display:block;color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0;margin-top:4px"></span>
     </div>
     <div class="table-wrap">
       <table>
@@ -685,8 +685,12 @@ function renderLatestScan(d) {
     return;
   }
 
+  const scanTime = d.scanned_at ? new Date(d.scanned_at).toLocaleTimeString("en-GB", {timeZone: "Asia/Singapore"}) : "unknown";
+  const weather = d.observed_high != null
+    ? `NOAA high ${d.observed_high.toFixed(1)}°C · observed ${new Date(d.observed_at).toLocaleTimeString("en-GB", {timeZone: "Asia/Singapore"})} SGT`
+    : "Forecast only";
   summary.textContent =
-    `${d.n_passed} passed · ${d.n_blocked} blocked · ${d.scan_date || ""}`;
+    `${d.n_passed} passed · ${d.n_blocked} blocked · ${d.scan_date || ""} · scanned ${scanTime} SGT${d.scan_stale ? " · STALE" : ""} · ${weather}`;
 
   const STATUS_BADGE = { PASS: "badge-pass", HOLD: "badge-hold", GATED: "badge-gated" };
 

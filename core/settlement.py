@@ -9,17 +9,16 @@ the early hours of the next):
   Task A — Resolution detection:
     Poll Gamma API outcomePrices for each open position's token_id.
     Terminal: outcomePrices[0] > 0.99 (YES) or < 0.01 (NO).
-    On terminal state → fetch actual temperature from NEA/Open-Meteo
-    historical archive → write calibration residual to ledger.
+    On terminal state → close the position and mark the signal settled.
 
   Task B — Actual temperature fetch (separate from resolution):
-    Uses Open-Meteo historical archive API to get the true observed
-    daily max at WSSS. This is written to calibration_logs regardless
-    of whether we had an open position — it feeds the trailing bias.
+    Reads the completed SGT day's WSSS METAR max from NOAA — the same
+    reports the market settles on (core/observations.py). This is written
+    to calibration_logs regardless of whether we had an open position —
+    it feeds the trailing bias and residual sigma.
 
-    THIS IS THE FIX for the settlement inference bug:
-    We do NOT infer actual temp from the bracket midpoint.
-    We fetch it directly from a meteorological archive.
+    The actual is the observed station reading, never inferred from which
+    bracket the market resolved to.
 """
 
 import json
@@ -29,25 +28,11 @@ import requests
 from typing import Dict, Optional
 
 from db.ledger import Ledger
+from core.observations import fetch_settled_high
 
 logger = logging.getLogger("hermes.settlement")
 
 GAMMA_MARKETS_URL   = "https://gamma-api.polymarket.com/markets"
-OPEN_METEO_HIST_URL = (
-    "https://archive-api.open-meteo.com/v1/archive"
-    "?latitude=1.3644&longitude=103.9915"
-    "&daily=temperature_2m_max"
-    "&timezone=Asia%2FSingapore"
-    "&start_date={date}&end_date={date}"
-)
-
-# NEA Singapore observed weather API (backup for Open-Meteo archive)
-# Returns daily station observations including Changi (station S24)
-NEA_READINGS_URL = (
-    "https://api.data.gov.sg/v1/environment/air-temperature"
-    "?date={date}"
-)
-CHANGI_STATION_ID = "S24"
 
 # Must match the fallback mu in core/model.py's fetch_gfs_forecast().
 # Used to detect and skip calibration writes when Job 2 never ran that day.
@@ -211,55 +196,25 @@ class SettlementEngine:
 
     def _fetch_actual_temperature(self, date: str) -> Optional[float]:
         """
-        Fetch the true observed daily maximum temperature at WSSS.
+        Completed-day WSSS max in the model's continuous units, or None to
+        retry next cycle (day not over, gappy reports, or NOAA unreachable).
 
-        Primary: Open-Meteo historical archive (reanalysis, reliable after ~6h lag).
-        Fallback: NEA data.gov.sg air temperature readings for Changi S24.
-
-        This is the critical fix over v4.2's settlement inference:
-        We get the real number, not a bracket midpoint proxy.
+        METARs report whole °C and core/model.py prices bracket "X°C" as
+        [X, X+1), so a reported X sits at X+0.5 in model space on average.
+        Logging the bare integer would bias every forecast 0.5°C low.
+        No fallback source: NEA S24 and Open-Meteo reanalysis are different
+        instruments than the one that settles the market.
         """
-        # ── Primary: Open-Meteo archive ───────────────────────────────────────
         try:
-            url  = OPEN_METEO_HIST_URL.format(date=date)
-            resp = requests.get(url, timeout=self.timeout)
-            resp.raise_for_status()
-            data = resp.json()
-
-            t_max_arr = data.get("daily", {}).get("temperature_2m_max", [])
-            if t_max_arr and t_max_arr[0] is not None:
-                actual = float(t_max_arr[0])
-                logger.info(f"[SETTLE] Open-Meteo archive: actual max = {actual:.2f}°C")
-                return actual
-
-        except Exception as e:
-            logger.warning(f"[SETTLE] Open-Meteo archive failed: {e} — trying NEA")
-
-        # ── Fallback: NEA data.gov.sg ─────────────────────────────────────────
-        try:
-            url  = NEA_READINGS_URL.format(date=date)
-            resp = requests.get(url, timeout=self.timeout)
-            resp.raise_for_status()
-            data = resp.json()
-
-            readings = data.get("items", [])
-            changi_max = None
-
-            for item in readings:
-                for reading in item.get("readings", []):
-                    if reading.get("station_id") == CHANGI_STATION_ID:
-                        val = reading.get("value")
-                        if val is not None:
-                            changi_max = max(changi_max or 0.0, float(val))
-
-            if changi_max is not None:
-                logger.info(f"[SETTLE] NEA Changi actual max = {changi_max:.2f}°C")
-                return changi_max
-
-        except Exception as e:
-            logger.error(f"[SETTLE] NEA fallback also failed: {e}")
-
-        return None
+            high = fetch_settled_high(date, timeout=self.timeout)
+        except (requests.RequestException, ValueError, KeyError) as e:
+            logger.warning(f"[SETTLE] NOAA METAR fetch failed for {date}: {e}")
+            return None
+        if high is None:
+            logger.info(f"[SETTLE] NOAA WSSS day {date} not complete yet")
+            return None
+        logger.info(f"[SETTLE] NOAA WSSS settled max = {high:.0f}°C (model space {high + 0.5:.1f}°C)")
+        return high + 0.5
 
     def count_stuck_positions(self) -> int:
         """
