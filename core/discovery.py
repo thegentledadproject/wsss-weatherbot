@@ -69,6 +69,33 @@ def _extract_temp_label(question: str) -> Optional[str]:
                 return label
     return None
 
+# ── Settlement gate (P1) ─────────────────────────────────────────────────────
+# BRACKETS in core/model.py assume: WSSS daily max, whole °C, [X, X+1). Every
+# event must say exactly that, or nothing from it is traded. Phrases below are
+# from live Gamma event descriptions (verified 2026-10-06); a reworded rule
+# fails closed — re-verify the wording, then update these.
+_OPEN_ENDED = re.compile(r"\bor (?:below|lower|less|higher|above|more)\b|\+|°F|fahrenheit", re.I)
+
+
+class SettlementAmbiguous(ValueError):
+    """Event wording does not map unambiguously onto the canonical target. NO TRADE."""
+
+
+def settlement_problem(event: dict, market_date: str) -> str:
+    """'' when the event settles on what the model prices, else the first mismatch."""
+    text = event.get("description") or ""
+    d = datetime.date.fromisoformat(market_date)
+    checks = [
+        ("station", "Singapore Changi Airport" in text),
+        ("variable", "highest temperature" in text.lower()),
+        ("source", "weather.gov/wrh/timeseries?site=wsss"
+                   in ((event.get("resolutionSource") or "") + " " + text).lower()),
+        ("precision", "whole degrees Celsius" in text),
+        ("date", f"{d.day} {d.strftime('%b')} '{d.strftime('%y')}" in text),
+    ]
+    return next((name for name, ok in checks if not ok), "")
+
+
 def _parse_clob_token_ids(market: dict) -> List[str]:
     """
     Extract clobTokenIds from a Gamma API market object.
@@ -110,7 +137,7 @@ def _build_slugs(date_str: str) -> List[str]:
         slugs.append(f"{base}-{mon_l}-{day_pad}-{year}")
     return slugs
 
-def _extract_markets_from_event(event: dict) -> Dict[str, Dict[str, str]]:
+def _extract_markets_from_event(event: dict, market_date: str) -> Dict[str, Dict[str, str]]:
     """
     Given one event object, extract {bracket_label: {"yes": yes_id, "no": no_id}}
     from its embedded markets. clobTokenIds is conventionally [yes_id, no_id] —
@@ -118,12 +145,23 @@ def _extract_markets_from_event(event: dict) -> Dict[str, Dict[str, str]]:
     token, rather than a naked (and unsupported) sell of YES.
     """
     found: Dict[str, Dict[str, str]] = {}
-    for market in event.get("markets", []):
+    markets = event.get("markets", [])
+    if any(_extract_temp_label(m.get("question", "") or m.get("title", "") or m.get("groupItemTitle", ""))
+           for m in markets):
+        problem = settlement_problem(event, market_date)
+        if problem:
+            raise SettlementAmbiguous(f"{event.get('slug') or event.get('title')}: settlement {problem} mismatch")
+    for market in markets:
         question = market.get("question", "") or market.get("title", "") \
                    or market.get("groupItemTitle", "")
+        if _OPEN_ENDED.search(question) or _OPEN_ENDED.search(market.get("groupItemTitle") or ""):
+            continue  # tail bucket ("38°C or higher"), not a [X, X+1) bracket
         label = _extract_temp_label(question)
         if not label:
             continue
+        title = market.get("groupItemTitle")
+        if (title and title != label) or label in found:
+            raise SettlementAmbiguous(f"{label}: question/title disagree or duplicate bracket")
         token_ids = _parse_clob_token_ids(market)
         if len(token_ids) >= 2:
             found[label] = {"yes": token_ids[0], "no": token_ids[1]}
@@ -140,6 +178,7 @@ class MarketDiscovery:
     def __init__(self, ledger: Ledger, timeout: int = 15):
         self.ledger  = ledger
         self.timeout = timeout
+        self.invalid_reason = ""  # set by run() when the settlement gate rejects the event
 
     def run(self, date: Optional[str] = None, quiet: bool = False) -> Dict[str, Dict[str, str]]:
         """
@@ -156,7 +195,14 @@ class MarketDiscovery:
             date = _today_str()
         logger.info(f"[DISCOVERY] Running market discovery for {date}")
 
-        token_matrix = self._fetch_from_gamma(date)
+        self.invalid_reason = ""
+        try:
+            token_matrix = self._fetch_from_gamma(date)
+        except SettlementAmbiguous as e:
+            # Never fall back to a cached matrix: the live contract is what settles.
+            self.invalid_reason = str(e)
+            logger.error(f"[DISCOVERY] INVALID → NO TRADE for {date}: {e}")
+            return {}
 
         if token_matrix:
             logger.info(
@@ -197,20 +243,24 @@ class MarketDiscovery:
         # ── Stage 1: query-param slug fetch (try each slug variant) ──────────
         for slug in slugs:
             try:
-                result = self._fetch_by_slug_query(slug)
+                result = self._fetch_by_slug_query(slug, today)
                 if result:
                     logger.info(f"[DISCOVERY] Found via /events?slug={slug}: {list(result.keys())}")
                     return result
+            except SettlementAmbiguous:
+                raise
             except Exception as e:
                 logger.warning(f"[DISCOVERY] /events?slug={slug} failed: {e}")
 
         # ── Stage 2: path-style slug fetch (try each slug variant) ───────────
         for slug in slugs:
             try:
-                result = self._fetch_by_slug_path(slug)
+                result = self._fetch_by_slug_path(slug, today)
                 if result:
                     logger.info(f"[DISCOVERY] Found via /events/slug/{slug}: {list(result.keys())}")
                     return result
+            except SettlementAmbiguous:
+                raise
             except Exception as e:
                 logger.warning(f"[DISCOVERY] /events/slug/{slug} failed: {e}")
 
@@ -220,12 +270,14 @@ class MarketDiscovery:
             if result:
                 logger.info(f"[DISCOVERY] Found via browse+filter: {list(result.keys())}")
                 return result
+        except SettlementAmbiguous:
+            raise
         except Exception as e:
             logger.warning(f"[DISCOVERY] Browse+filter failed: {e}")
 
         return {}
 
-    def _fetch_by_slug_query(self, slug: str) -> Dict[str, Dict[str, str]]:
+    def _fetch_by_slug_query(self, slug: str, date: str) -> Dict[str, Dict[str, str]]:
         """GET /events?slug=<slug> — the documented, confirmed-correct resource."""
         logger.info(f"[DISCOVERY] Trying /events?slug={slug}")
         resp = requests.get(GAMMA_EVENTS_URL, params={"slug": slug}, timeout=self.timeout)
@@ -235,10 +287,10 @@ class MarketDiscovery:
         events = data if isinstance(data, list) else data.get("events", [data] if data else [])
         found: Dict[str, Dict[str, str]] = {}
         for event in events:
-            found.update(_extract_markets_from_event(event))
+            found.update(_extract_markets_from_event(event, date))
         return found
 
-    def _fetch_by_slug_path(self, slug: str) -> Dict[str, Dict[str, str]]:
+    def _fetch_by_slug_path(self, slug: str, date: str) -> Dict[str, Dict[str, str]]:
         """GET /events/slug/<slug> — path-style variant, single event object returned."""
         url = f"{GAMMA_EVENTS_URL}/slug/{slug}"
         logger.info(f"[DISCOVERY] Trying {url}")
@@ -249,7 +301,7 @@ class MarketDiscovery:
         event = resp.json()
         if not isinstance(event, dict):
             return {}
-        return _extract_markets_from_event(event)
+        return _extract_markets_from_event(event, date)
 
     def _browse_and_filter(self, today: str, max_pages: int = 4) -> Dict[str, Dict[str, str]]:
         """
@@ -316,7 +368,7 @@ class MarketDiscovery:
                 if not (slug_hit or title_hit):
                     continue
 
-                found = _extract_markets_from_event(event)
+                found = _extract_markets_from_event(event, today)
                 if found:
                     return found
 
@@ -346,14 +398,17 @@ class MarketDiscovery:
         live: Dict[str, Dict[str, str]] = {}
         try:
             for slug in slugs:
-                live = self._fetch_by_slug_query(slug)
+                live = self._fetch_by_slug_query(slug, date)
                 if live:
                     break
             if not live:
                 for slug in slugs:
-                    live = self._fetch_by_slug_path(slug)
+                    live = self._fetch_by_slug_path(slug, date)
                     if live:
                         break
+        except SettlementAmbiguous as e:
+            logger.error(f"[DISCOVERY] Settlement ambiguous on validation — {e}")
+            return False
         except Exception as e:
             logger.warning(f"[DISCOVERY] Validation fetch failed: {e} — skipping check.")
             return True  # non-fatal: don't block trading on a validation network hiccup
